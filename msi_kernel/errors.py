@@ -57,6 +57,32 @@ class InvalidMessageError(KernelError):
         super().__init__(message + suffix)
 
 
+class CapacityExceededError(KernelError):
+    """请求接纳会超过容量上限（等待队列 / 每核未完成请求数）。
+
+    与输入合法性错误区分：请求本身合法，但当前没有容量接纳它。
+    报错在任何状态变更之前抛出，单请求不会部分准入；批量接纳时整批
+    零变更（request_seq 定位批中位置）。
+
+    属性:
+        request_seq: 触发上限的请求在批次中的序号（单请求为 0）。
+        field:       触及的上限名："queue" / "core_outstanding"。
+        cap:         该上限的容量。
+        used:        抛出时已占用的容量。
+    """
+
+    def __init__(self, message: str, *, field: str, cap: int, used: int,
+                 request_seq: int | None = None) -> None:
+        self.field = field
+        self.cap = cap
+        self.used = used
+        self.request_seq = request_seq
+        loc = [f"field={field!r}", f"used={used}", f"cap={cap}"]
+        if request_seq is not None:
+            loc.append(f"request_seq={request_seq}")
+        super().__init__(message + f" [{', '.join(loc)}]")
+
+
 class BudgetExhaustedError(KernelError):
     """有界搜索的交付步数预算耗尽（没证明任何东西，只是没搜完）。
 

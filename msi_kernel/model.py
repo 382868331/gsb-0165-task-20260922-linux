@@ -20,16 +20,52 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Optional, Union
 
-from .errors import InvalidMessageError, InvalidRequestError
+from .errors import CapacityExceededError, InvalidMessageError, InvalidRequestError
 
 NUM_CORES = 3
 NUM_ADDRS = 8
 # 目录在 src/dst 中的编号（核编号为 0..NUM_CORES-1）。
 DIR = NUM_CORES
+
+
+@dataclass(frozen=True)
+class Limits:
+    """三类资源容量上限（均为正整数）。
+
+    queue_cap:    目录 **每个地址** 的 FIFO 等待队列长度上限（活动事务之外
+                  还能排队多少条同地址请求）；
+    core_cap:     **每个核** 已接纳但未完成的请求数上限（活动事务中的请求
+                  与在目录队列中等待的请求都计入）；
+    channel_cap:  **每条有向网络通道**（DIR→核 c 与 核 c→DIR 各算一条）上
+                  在途（已发送、未投递）消息数上限。
+
+    任一字段为非正整数、bool 或非 int 时构造即拒绝。
+    """
+
+    queue_cap: int = 8
+    core_cap: int = 8
+    channel_cap: int = 8
+
+    def __post_init__(self) -> None:
+        for name in ("queue_cap", "core_cap", "channel_cap"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise InvalidRequestError(
+                    f"{name} 必须是正整数 int，收到 {type(value).__name__}: "
+                    f"{value!r}", field=name)
+            if value <= 0:
+                raise InvalidRequestError(
+                    f"{name} 必须是正整数，收到 {value}", field=name)
+
+
+# 不显式给 limits 时的默认有限容量（足以容纳固定 3 核 8 地址规模下的正常
+# 并发：同一通道同一时刻至多 2 条报文、每地址等待队列至多 5 条）。
+DEFAULT_LIMITS = Limits()
 
 
 class State(str, Enum):
@@ -159,7 +195,9 @@ class DeliveryReport:
     """deliver 的结果报告。
 
     completions 为本次投递直接完成、或经 FIFO 链锁反应完成的全部事务。
-    emitted 为本次投递新产生的待发消息。
+    emitted 为本次投递新产生的待发（在途）消息。
+    released 为本次投递腾出通道后，从发送端保留区自动续传进入在途通道
+    的消息；背压解除前它们不占据通道、也不可被投递。
     """
 
     msg_id: Optional[int]
@@ -168,10 +206,33 @@ class DeliveryReport:
     reason: Optional[str]
     emitted: tuple[Message, ...]
     completions: tuple[Completion, ...]
+    released: tuple[Message, ...] = ()
 
     @property
     def applied(self) -> bool:
         return self.status is DeliveryStatus.APPLIED
+
+
+@dataclass(frozen=True)
+class ChannelView:
+    """一条有向网络通道（src->dst）上的在途消息视图。"""
+
+    src: int
+    dst: int
+    in_flight: tuple[Message, ...]
+
+
+@dataclass(frozen=True)
+class RetainedView:
+    """发送端背压保留：通道满时消息先留在发送端，未进入在途通道。
+
+    src/dst 为该消息最终要走的通道；in_flight 为按 msg_id 升序排列的
+    保留消息（它们不属于任何通道的在途计数）。
+    """
+
+    src: int
+    dst: int
+    retained: tuple[Message, ...]
 
 
 @dataclass(frozen=True)
@@ -182,6 +243,9 @@ class Snapshot:
     pending_messages: tuple[Message, ...]
     queues: tuple[tuple[QueuedRequestView, ...], ...]
     completed: tuple[Completion, ...]
+    channels: tuple[ChannelView, ...] = ()
+    retained: tuple[RetainedView, ...] = ()
+    limits: Optional[Limits] = None
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +279,10 @@ class _DirEntry:
     owner: Optional[int] = None
     txn: Optional[_Txn] = None
     queue: list[Request] = field(default_factory=list)
+
+
+def _channel_key(src: int, dst: int) -> tuple[int, int]:
+    return (src, dst)
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +372,25 @@ class CacheCoherenceKernel:
     构造:
         memory: 可选 {addr: int} 初始内存映像；缺省所有地址为 0。
                 值必须是 int（bool / float / NaN / Infinity 一律拒绝）。
+        limits: 可选 Limits 容量配置；缺省为有限的 DEFAULT_LIMITS。
+                三类上限：每地址等待队列、每核未完成请求、每条有向网络
+                通道在途消息。通道满时内核发送的报文保留在发送端
+                （retained），事务保持未完成，待通道腾出后自动续传；
+                请求接纳会超过队列 / 每核上限时抛 CapacityExceededError，
+                且任何状态变更之前抛出（批次整体零变更）。
     """
 
-    def __init__(self, memory: Optional[dict[int, int]] = None) -> None:
+    def __init__(self, memory: Optional[dict[int, int]] = None,
+                 limits: Optional[Limits] = None) -> None:
         if memory is not None and not isinstance(memory, dict):
             raise InvalidRequestError("memory 必须是 dict[int, int]",
                                       field="memory")
+        if limits is None:
+            limits = DEFAULT_LIMITS
+        elif not isinstance(limits, Limits):
+            raise InvalidRequestError(
+                f"limits 必须是 Limits 实例，收到 {type(limits).__name__}",
+                field="limits")
         mem = [0] * NUM_ADDRS
         if memory:
             for addr, value in memory.items():
@@ -317,11 +398,19 @@ class CacheCoherenceKernel:
                 _check_int("memory value", value)
                 mem[addr] = value
         self._memory: list[int] = mem
+        self._limits: Limits = limits
         self._dir: list[_DirEntry] = [_DirEntry() for _ in range(NUM_ADDRS)]
         self._caches: list[dict[int, _CacheLine]] = [
             {a: _CacheLine() for a in range(NUM_ADDRS)} for _ in range(NUM_CORES)
         ]
+        # 在途（已发送、待投递）消息：msg_id -> Message。
         self._pending: dict[int, Message] = {}
+        # 通道在途计数：(src,dst) -> 条数；与 _pending 严格同步。
+        self._in_flight: dict[tuple[int, int], int] = {}
+        # 背压保留（通道满时尚未进入在途通道）：(src,dst) -> [msg_id...]（FIFO）。
+        self._retained: dict[tuple[int, int], list[int]] = {}
+        # 保留消息体：msg_id -> Message（保留消息不占 msg_id 之外的通道资源）。
+        self._retained_msgs: dict[int, Message] = {}
         self._history: dict[int, Message] = {}
         self._completed: list[Completion] = []
         self._used_txn: set[int] = set()
@@ -339,8 +428,39 @@ class CacheCoherenceKernel:
         return NUM_ADDRS
 
     def pending(self) -> tuple[Message, ...]:
-        """当前待发（待投递）消息，按 msg_id 升序。"""
+        """当前在途（待投递）消息，按 msg_id 升序。
+
+        背压保留在发送端的消息不计入（见 retained_messages()），它们在
+        通道腾出之前不可投递。
+        """
         return tuple(self._pending[i] for i in sorted(self._pending))
+
+    def retained_messages(self) -> tuple[Message, ...]:
+        """因目标通道满而保留在发送端、尚未进入在途通道的消息。"""
+        return tuple(self._retained_msgs[i]
+                     for i in sorted(self._retained_msgs))
+
+    @property
+    def limits(self) -> Limits:
+        return self._limits
+
+    def _channel_in_flight(self, src: int, dst: int) -> int:
+        return self._in_flight.get((src, dst), 0)
+
+    def channel_load(self, src: int, dst: int) -> int:
+        """某条有向通道当前在途消息数（观测用，含校验）。"""
+        _check_int("src", src, msg=True)
+        _check_int("dst", dst, msg=True)
+        return self._channel_in_flight(src, dst)
+
+    def _outstanding_for_core(self, core: int) -> int:
+        """该核已接纳但未完成的请求数：活动事务 + 各地址队列中的请求。"""
+        count = 0
+        for e in self._dir:
+            if e.txn is not None and e.txn.core == core:
+                count += 1
+            count += sum(1 for r in e.queue if r.core == core)
+        return count
 
     def completed(self) -> tuple[Completion, ...]:
         return tuple(self._completed)
@@ -369,6 +489,22 @@ class CacheCoherenceKernel:
             )
             for e in self._dir
         )
+        # 只在快照里暴露实际非空的通道 / 非空保留区，避免噪声。
+        by_channel: dict[tuple[int, int], list[Message]] = {}
+        for m in self._pending.values():
+            by_channel.setdefault((m.src, m.dst), []).append(m)
+        channels = tuple(
+            ChannelView(src, dst,
+                        tuple(sorted(ms, key=lambda m: m.msg_id)))
+            for (src, dst), ms in sorted(by_channel.items())
+        )
+        retained = tuple(
+            RetainedView(src, dst,
+                         tuple(self._retained_msgs[i]
+                               for i in self._retained[(src, dst)]))
+            for (src, dst) in sorted(self._retained)
+            if self._retained[(src, dst)]
+        )
         return Snapshot(
             caches=caches,
             directory=directory,
@@ -376,6 +512,9 @@ class CacheCoherenceKernel:
             pending_messages=self.pending(),
             queues=queues,
             completed=tuple(self._completed),
+            channels=channels,
+            retained=retained,
+            limits=self._limits,
         )
 
     # -- 请求输入 -----------------------------------------------------------
@@ -417,11 +556,19 @@ class CacheCoherenceKernel:
                         request_seq=seq, field="txn_id")
                 seen_ids.add(req.txn_id)
             validated.append(req)
+        # 容量判定可能在接纳到一半时才触发（前一条改变了队列/每核占用）。
+        # 在深副本上试接纳整批：任一 CapacityExceededError 都丢弃副本，
+        # 原内核零变更，绝不留下部分接纳。
+        trial = copy.deepcopy(self)
         reports: list[RequestReport] = []
-        for req in validated:
-            # _admit 内部负责自动 id 的分配与显式 id 的登记；
-            # 能走到这里的请求已通过全部校验，接纳过程不会再失败。
-            reports.append(self._admit(req))
+        for seq, req in enumerate(validated):
+            try:
+                reports.append(trial._admit(req))
+            except CapacityExceededError as exc:
+                exc.request_seq = seq
+                raise
+        # 全部接纳成功：副本状态整体替换进来（trial 随即丢弃，可直接移交）。
+        self.__dict__.update(trial.__dict__)
         return reports
 
     def _alloc_txn(self) -> int:
@@ -433,6 +580,25 @@ class CacheCoherenceKernel:
         return tid
 
     def _admit(self, req: Request) -> RequestReport:
+        # 容量判定先于 txn id 分配等任何状态变更，超容量不留部分准入。
+        entry = self._dir[req.addr]
+        will_queue = entry.txn is not None or bool(entry.queue)
+        if will_queue:
+            used = len(entry.queue)
+            if used >= self._limits.queue_cap:
+                raise CapacityExceededError(
+                    f"地址 {req.addr} 的目录等待队列已满（{used} 条请求"
+                    f"正在活动事务之外排队），新请求不能被接纳",
+                    field="queue", cap=self._limits.queue_cap, used=used)
+        stays_outstanding = will_queue or self._would_block(req, entry)
+        if stays_outstanding:
+            used_core = self._outstanding_for_core(req.core)
+            if used_core >= self._limits.core_cap:
+                raise CapacityExceededError(
+                    f"核 {req.core} 已有 {used_core} 条接纳但未完成的请求，"
+                    f"新请求不能被接纳",
+                    field="core_outstanding", cap=self._limits.core_cap,
+                    used=used_core)
         if req.txn_id is None:
             req = Request(req.core, req.addr, req.op, req.value,
                           self._alloc_txn())
@@ -443,12 +609,26 @@ class CacheCoherenceKernel:
             self._used_txn.add(req.txn_id)
             if req.txn_id >= self._next_txn:
                 self._next_txn = req.txn_id + 1
-        entry = self._dir[req.addr]
-        if entry.txn is not None or entry.queue:
+        if will_queue:
             entry.queue.append(req)
             return RequestReport(req.txn_id, True, ())
         completions = self._start(req, entry)
         return RequestReport(req.txn_id, False, tuple(completions))
+
+    def _would_block(self, req: Request, entry: _DirEntry) -> bool:
+        """地址空闲时该请求是否需要消息往返才能完成（因而会占每核容量）。
+
+        判定与 _start 的分支严格一致：纯函数，不修改状态。
+        """
+        if req.op is Op.LOAD:
+            # 仅“读别的核拥有的 M”需要 FETCH/FLUSH。
+            return entry.state is State.MODIFIED and entry.owner != req.core
+        if entry.state is State.MODIFIED:
+            return entry.owner != req.core
+        if entry.state is State.INVALID:
+            return False
+        # 目录 S：除请求者外还有别的共享者时必须发 INV。
+        return any(c != req.core for c in entry.sharers)
 
     # -- 协议推进 -----------------------------------------------------------
 
@@ -540,11 +720,35 @@ class CacheCoherenceKernel:
 
     def _send(self, mtype: MsgType, src: int, dst: int, addr: int,
               txn_id: int, value: Optional[int] = None) -> int:
+        """发送一条内核产生的报文。
+
+        目标有向通道在途数已达 channel_cap 时，报文保留在发送端保留区
+        （分配 msg_id、保留消息体，但不进入在途通道、不计通道占用、
+        不可投递）；事务因此保持未完成。待该通道有报文被投递腾出空位后，
+        _release_retained 按 msg_id 升序 FIFO 自动续传。
+        """
         msg_id = self._next_msg
         self._next_msg += 1
-        self._pending[msg_id] = Message(
-            msg_id, txn_id, mtype, src, dst, addr, value)
+        msg = Message(msg_id, txn_id, mtype, src, dst, addr, value)
+        key = (src, dst)
+        if self._channel_in_flight(src, dst) >= self._limits.channel_cap:
+            self._retained.setdefault(key, []).append(msg_id)
+            self._retained_msgs[msg_id] = msg
+        else:
+            self._pending[msg_id] = msg
+            self._in_flight[key] = self._channel_in_flight(src, dst) + 1
         return msg_id
+
+    def _release_retained(self, freed_key: tuple[int, int],
+                          released: list[Message]) -> None:
+        """通道 freed_key 腾出空位后，把该通道保留消息按 FIFO 续传。"""
+        queue = self._retained.get(freed_key)
+        while queue and self._channel_in_flight(*freed_key) < self._limits.channel_cap:
+            msg_id = queue.pop(0)
+            msg = self._retained_msgs.pop(msg_id)
+            self._pending[msg_id] = msg
+            self._in_flight[freed_key] = self._channel_in_flight(*freed_key) + 1
+            released.append(msg)
 
     def deliver(self, what: Union[int, Message]) -> DeliveryReport:
         """显式网络投递。
@@ -554,13 +758,16 @@ class CacheCoherenceKernel:
                   （msg_id 字段传 None，表示外部网络输入）。
 
         语义:
-        - 正常消息生效并从待发队列移除；
+        - 正常消息生效并从在途通道移除（腾出 1 个通道位置）；
         - 同一 msg_id 重复投递：IGNORED_DUPLICATE，幂等无副作用；
         - 报文属于已结束/其他事务（典型：陈旧 INV_ACK/FLUSH）：
-          IGNORED_STALE，不推进当前新事务；
-        - msg_id 从不存在：InvalidMessageError；
+          IGNORED_STALE，不推进当前新事务，但报文本身已到达、仍腾出通道；
+        - msg_id 从不存在：InvalidMessageError；msg_id 仍是背压保留消息
+          （尚未进入在途通道）：InvalidMessageError 明确提示不可投递；
         - 注入消息引用从未注册的 txn_id、或字段非法：InvalidMessageError。
 
+        容量与背压：本次处理新产生的报文在 emitted 中（目标通道满的那些
+        同时仍在发送端保留）；腾出通道后自动续传的保留消息在 released 中。
         失败不留部分变更：所有有效性判定在任何状态修改之前完成。
         """
         if isinstance(what, Message):
@@ -574,24 +781,42 @@ class CacheCoherenceKernel:
                     "该消息已投递过，重复投递不产生任何效果", (), ())
             msg = self._pending.get(what)
             if msg is None:
+                if what in self._retained_msgs:
+                    raise InvalidMessageError(
+                        f"msg_id={what} 仍因目标通道满而保留在发送端，"
+                        f"尚未进入在途通道，当前不能投递", msg_id=what)
                 raise InvalidMessageError(
                     f"msg_id={what} 既不在待发队列也无投递历史", msg_id=what)
             injected = False
 
-        before = set(self._pending)
+        # 先在“通道仍占满”的状态下生效：本次新产生、走同一通道的报文会
+        # 排在已有保留消息之后，保证每通道严格按 msg_id 序 FIFO 续传。
+        start_next_msg = self._next_msg
         done: list[Completion] = []
         stale_reason = self._apply(msg, done)
-        new_msgs = tuple(m for i, m in self._pending.items() if i not in before)
+        emitted = tuple(
+            self._pending[i] if i in self._pending else self._retained_msgs[i]
+            for i in range(start_next_msg, self._next_msg)
+        )
+
+        released: list[Message] = []
         if not injected:
+            key = (msg.src, msg.dst)
             del self._pending[msg.msg_id]
+            self._in_flight[key] = self._channel_in_flight(*key) - 1
+            if self._in_flight[key] <= 0:
+                self._in_flight.pop(key, None)
             self._history[msg.msg_id] = msg
+            # 报文已到达（即便陈旧）：腾出通道并续传保留消息。
+            self._release_retained(key, released)
+
         if stale_reason is not None:
             return DeliveryReport(
                 msg.msg_id, msg.txn_id, DeliveryStatus.IGNORED_STALE,
-                stale_reason, (), ())
+                stale_reason, (), (), tuple(released))
         return DeliveryReport(
             msg.msg_id, msg.txn_id, DeliveryStatus.APPLIED, None,
-            new_msgs, tuple(done))
+            emitted, tuple(done), tuple(released))
 
     # -- 注入消息校验 -------------------------------------------------------
 

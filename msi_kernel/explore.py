@@ -79,6 +79,11 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
         (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value)
         for m in snap.pending_messages
     ))
+    # 背压保留消息单独成指纹：它们不可投递，必须与在途消息区分开。
+    retained = tuple(sorted(
+        (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value)
+        for v in snap.retained for m in v.retained
+    ))
     queues = tuple(
         tuple((q.txn_id, q.core, q.op.value, q.value) for q in qq)
         for qq in snap.queues
@@ -86,7 +91,7 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     completed = tuple(
         (c.txn_id, c.op.value, c.value) for c in snap.completed
     )
-    return caches, directory, snap.memory, pend, queues, completed
+    return caches, directory, snap.memory, pend, retained, queues, completed
 
 
 def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
@@ -135,6 +140,35 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
                 return f"addr={a}: 目录 I 但 owner={d.owner} 非空"
             if any(s is not State.INVALID for s in states.values()):
                 return f"addr={a}: 目录 I 却存在非 I 缓存"
+    # ---- 容量上限不变量（题面新增）----
+    lim = snap.limits
+    if lim is not None:
+        for a in range(NUM_ADDRS):
+            if len(snap.queues[a]) > lim.queue_cap:
+                return (f"addr={a}: 等待队列长度 {len(snap.queues[a])} "
+                        f"超过上限 {lim.queue_cap}")
+        # 每核未完成请求数（活动事务 + 各地址队列），直接以内核口径精确统计。
+        for c in range(NUM_CORES):
+            used = kernel._outstanding_for_core(c)
+            if used > lim.core_cap:
+                return (f"核 {c}: 未完成请求数 {used} 超过上限 {lim.core_cap}")
+        for ch in snap.channels:
+            if len(ch.in_flight) > lim.channel_cap:
+                return (f"通道 {ch.src}->{ch.dst}: 在途消息 "
+                        f"{len(ch.in_flight)} 条超过上限 {lim.channel_cap}")
+        # 保留区与在途区不得持有同一 msg_id，且保留消息不计任何通道占用。
+        retained_ids = {m.msg_id for v in snap.retained for m in v.retained}
+        pending_ids = {m.msg_id for m in snap.pending_messages}
+        overlap = retained_ids & pending_ids
+        if overlap:
+            return f"消息 {sorted(overlap)} 同时处于保留区与在途通道"
+        # 存在保留消息的通道必然仍是满的（否则应已续传），否则系统卡死。
+        inflight_count = {(ch.src, ch.dst): len(ch.in_flight)
+                          for ch in snap.channels}
+        for v in snap.retained:
+            if inflight_count.get((v.src, v.dst), 0) < lim.channel_cap:
+                return (f"通道 {v.src}->{v.dst} 有 {len(v.retained)} 条保留"
+                        f"消息但在途未满，保留消息应已续传（系统卡死）")
     return None
 
 
@@ -202,7 +236,8 @@ def explore(factory: KernelFactory, scenario: Scenario = (), *,
 
     def note_terminal(k: CacheCoherenceKernel, path: tuple[int, ...]) -> None:
         schedules[path] = k.completed()
-        terminal_fps.add(descriptor(k)[:5])
+        # 终态不计完成事件的具体身份，只比结构指纹。
+        terminal_fps.add(descriptor(k)[:-1])
         for comp in k.completed():
             if comp.op is Op.LOAD:
                 read_values.setdefault(comp.txn_id, set()).add(comp.value)
