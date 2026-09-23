@@ -10,6 +10,7 @@ from .errors import (
     KernelError,
     InvalidRequestError,
     InvalidMessageError,
+    CapacityExceededError,
     BudgetExhaustedError,
     InfeasibleError,
 )
@@ -26,6 +27,12 @@ from .model import (
     Completion,
     RequestReport,
     DeliveryReport,
+    CapacityConfig,
+    CapacityView,
+    CacheView,
+    DirectoryView,
+    QueuedRequestView,
+    Snapshot,
     CacheCoherenceKernel,
 )
 from .explore import (
@@ -51,6 +58,12 @@ __all__ = [
     "Completion",
     "RequestReport",
     "DeliveryReport",
+    "CapacityConfig",
+    "CapacityView",
+    "CacheView",
+    "DirectoryView",
+    "QueuedRequestView",
+    "Snapshot",
     "CacheCoherenceKernel",
     "explore",
     "find_schedule",
@@ -62,6 +75,7 @@ __all__ = [
     "KernelError",
     "InvalidRequestError",
     "InvalidMessageError",
+    "CapacityExceededError",
     "BudgetExhaustedError",
     "InfeasibleError",
 ]

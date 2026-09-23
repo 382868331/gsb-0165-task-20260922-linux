@@ -20,11 +20,16 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Optional, Union
 
-from .errors import InvalidMessageError, InvalidRequestError
+from .errors import (
+    CapacityExceededError,
+    InvalidMessageError,
+    InvalidRequestError,
+)
 
 NUM_CORES = 3
 NUM_ADDRS = 8
@@ -68,6 +73,59 @@ class DeliveryStatus(str, Enum):
     APPLIED = "applied"             # 正常生效
     IGNORED_DUPLICATE = "duplicate"  # 同一 msg_id 已投递过，幂等忽略
     IGNORED_STALE = "stale"          # 报文与当前活动事务不符（如陈旧 ACK），不推进新事务
+
+
+@dataclass(frozen=True)
+class CapacityConfig:
+    """三类容量上限配置。
+
+    dir_queue_cap:    目录 **每个地址** 的等待队列长度上限（活动事务本身
+                      不占队列槽位；只有 FIFO 等待中的请求占）。None 无限。
+    core_request_cap: 每个核的 **在途请求数** 上限 = 该核在某地址上作为
+                      活动事务 + 在各地址队列中等待的请求总数。None 无限。
+    network_cap:      网络通道中 **待发报文总数** 上限（全局，跨所有地址）。
+                      满了不报错：待发消息进入 blocked 暂存区保留，事务保持
+                      未完成；任何 deliver 腾出槽位后按 blocked 的 FIFO 自动
+                      补发，也可用 retry_blocked() 显式补发。None 无限。
+
+    容量必须为正整数或 None（0/负数/bool/float 均拒绝）。
+    三个缺省值都远大于本固定规模（3 核 8 地址）可能产生的数量，因此使用
+    缺省配置时可观测行为与无容量旧模型完全一致。
+    """
+
+    dir_queue_cap: Optional[int] = 4096
+    core_request_cap: Optional[int] = 4096
+    network_cap: Optional[int] = 4096
+
+
+@dataclass(frozen=True)
+class CapacityView:
+    """容量用量的只读视图。
+
+    dir_queues: 每地址等待队列当前长度；
+    core_inflight: 每核在途请求数（活动事务 + 等待队列）；
+    network_pending: 待发队列中的报文数；
+    network_blocked: 因通道满而保留、尚未进入待发队列的报文数；
+    config: 当前生效的容量配置。
+    """
+
+    dir_queues: tuple[int, ...]
+    core_inflight: tuple[int, ...]
+    network_pending: int
+    network_blocked: int
+    config: CapacityConfig
+
+    def dir_queue_spare(self, addr: int) -> Optional[int]:
+        cap = self.config.dir_queue_cap
+        return None if cap is None else cap - self.dir_queues[addr]
+
+    def core_spare(self, core: int) -> Optional[int]:
+        cap = self.config.core_request_cap
+        return None if cap is None else cap - self.core_inflight[core]
+
+    def network_spare(self) -> Optional[int]:
+        cap = self.config.network_cap
+        return None if cap is None else cap - self.network_pending
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +217,11 @@ class DeliveryReport:
     """deliver 的结果报告。
 
     completions 为本次投递直接完成、或经 FIFO 链锁反应完成的全部事务。
-    emitted 为本次投递新产生的待发消息。
+    emitted 为本次投递新产生、并已 **进入待发队列** 的消息。
+    blocked 为本次投递中新产生、但因网络通道已满而进入 blocked 暂存区的
+    消息（它们保留事务的未完成状态，未丢失；腾出槽位后按 FIFO 自动补发，
+    补发时不再出现在任何报告的 emitted 中，可用 released() 观测）。
+    released 为本次投递腾出槽位后，从 blocked 自动补发到待发队列的消息。
     """
 
     msg_id: Optional[int]
@@ -168,6 +230,8 @@ class DeliveryReport:
     reason: Optional[str]
     emitted: tuple[Message, ...]
     completions: tuple[Completion, ...]
+    blocked: tuple[Message, ...] = ()
+    released: tuple[Message, ...] = ()
 
     @property
     def applied(self) -> bool:
@@ -182,6 +246,8 @@ class Snapshot:
     pending_messages: tuple[Message, ...]
     queues: tuple[tuple[QueuedRequestView, ...], ...]
     completed: tuple[Completion, ...]
+    blocked_messages: tuple[Message, ...] = ()
+    capacity: Optional[CapacityView] = None
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +359,32 @@ def _validate_request(req: object, *, request_seq: Optional[int]) -> Request:
     return req
 
 
+def _validate_cap_value(name: str, x) -> None:
+    # 容量必须是非负整数或 None；bool 是 int 子类，显式拒绝。
+    if x is None:
+        return
+    if isinstance(x, bool):
+        raise InvalidRequestError(
+            f"{name} 必须是非负整数或 None，收到 bool: {x!r}", field=name)
+    if isinstance(x, float):
+        raise InvalidRequestError(
+            f"{name} 必须是非负整数或 None，收到 float: {x!r}", field=name)
+    if not isinstance(x, int):
+        raise InvalidRequestError(
+            f"{name} 必须是非负整数或 None，收到 {type(x).__name__}: {x!r}",
+            field=name)
+    if x < 0:
+        raise InvalidRequestError(
+            f"{name} 不能为负数，收到 {x}（0 表示该类入口不允许排队/在途）",
+            field=name)
+
+
+def _validate_capacity(cap: CapacityConfig) -> None:
+    _validate_cap_value("dir_queue_cap", cap.dir_queue_cap)
+    _validate_cap_value("core_request_cap", cap.core_request_cap)
+    _validate_cap_value("network_cap", cap.network_cap)
+
+
 # ---------------------------------------------------------------------------
 # 内核
 # ---------------------------------------------------------------------------
@@ -302,14 +394,37 @@ class CacheCoherenceKernel:
     """消息驱动 MSI 目录内核。
 
     构造:
-        memory: 可选 {addr: int} 初始内存映像；缺省所有地址为 0。
-                值必须是 int（bool / float / NaN / Infinity 一律拒绝）。
+        memory:   可选 {addr: int} 初始内存映像；缺省所有地址为 0。
+                  值必须是 int（bool / float / NaN / Infinity 一律拒绝）。
+        capacity: 可选 CapacityConfig，设置目录等待队列 / 每核在途请求 /
+                  网络通道三类容量上限；缺省容量很大，可观测行为与无容量
+                  旧模型一致。也可直接传三个关键字（dir_queue_cap 等）。
     """
 
-    def __init__(self, memory: Optional[dict[int, int]] = None) -> None:
+    def __init__(self, memory: Optional[dict[int, int]] = None, *,
+                 capacity: Optional[CapacityConfig] = None,
+                 dir_queue_cap: Optional[int] = None,
+                 core_request_cap: Optional[int] = None,
+                 network_cap: Optional[int] = None) -> None:
         if memory is not None and not isinstance(memory, dict):
             raise InvalidRequestError("memory 必须是 dict[int, int]",
                                       field="memory")
+        if capacity is None:
+            capacity = CapacityConfig()
+        elif not isinstance(capacity, CapacityConfig):
+            raise InvalidRequestError(
+                "capacity 必须是 CapacityConfig 实例", field="capacity")
+        # 显式关键字覆盖配置中的对应项。
+        if dir_queue_cap is not None:
+            capacity = CapacityConfig(
+                dir_queue_cap, capacity.core_request_cap, capacity.network_cap)
+        if core_request_cap is not None:
+            capacity = CapacityConfig(
+                capacity.dir_queue_cap, core_request_cap, capacity.network_cap)
+        if network_cap is not None:
+            capacity = CapacityConfig(
+                capacity.dir_queue_cap, capacity.core_request_cap, network_cap)
+        _validate_capacity(capacity)
         mem = [0] * NUM_ADDRS
         if memory:
             for addr, value in memory.items():
@@ -317,16 +432,48 @@ class CacheCoherenceKernel:
                 _check_int("memory value", value)
                 mem[addr] = value
         self._memory: list[int] = mem
+        self._cap: CapacityConfig = capacity
         self._dir: list[_DirEntry] = [_DirEntry() for _ in range(NUM_ADDRS)]
         self._caches: list[dict[int, _CacheLine]] = [
             {a: _CacheLine() for a in range(NUM_ADDRS)} for _ in range(NUM_CORES)
         ]
         self._pending: dict[int, Message] = {}
+        # 因网络通道满而保留的消息，按产生顺序 FIFO（每项含 msg_id 已分配）。
+        self._blocked: list[Message] = []
         self._history: dict[int, Message] = {}
         self._completed: list[Completion] = []
         self._used_txn: set[int] = set()
         self._next_txn = 1
         self._next_msg = 1
+
+    # -- 容量观测 -----------------------------------------------------------
+
+    @property
+    def capacity_config(self) -> CapacityConfig:
+        return self._cap
+
+    def _core_inflight(self, core: int) -> int:
+        n = 0
+        for e in self._dir:
+            if e.txn is not None and e.txn.core == core:
+                n += 1
+            n += sum(1 for r in e.queue if r.core == core)
+        return n
+
+    def capacity_view(self) -> CapacityView:
+        """返回三类容量的当前用量与剩余槽位。"""
+        return CapacityView(
+            dir_queues=tuple(len(e.queue) for e in self._dir),
+            core_inflight=tuple(self._core_inflight(c)
+                                for c in range(NUM_CORES)),
+            network_pending=len(self._pending),
+            network_blocked=len(self._blocked),
+            config=self._cap,
+        )
+
+    def blocked(self) -> tuple[Message, ...]:
+        """因网络通道满而保留、尚未进入待发队列的消息（FIFO 顺序）。"""
+        return tuple(self._blocked)
 
     # -- 观测 ---------------------------------------------------------------
 
@@ -376,6 +523,8 @@ class CacheCoherenceKernel:
             pending_messages=self.pending(),
             queues=queues,
             completed=tuple(self._completed),
+            blocked_messages=self.blocked(),
+            capacity=self.capacity_view(),
         )
 
     # -- 请求输入 -----------------------------------------------------------
@@ -418,10 +567,16 @@ class CacheCoherenceKernel:
                 seen_ids.add(req.txn_id)
             validated.append(req)
         reports: list[RequestReport] = []
-        for req in validated:
+        # 容量是有状态资源：整批必须在“真实内核”上顺序通过容量检查。
+        # 先在完整副本上预演整批：任何一条触及容量上限都只污染副本，
+        # 真实内核零变更（不分配/不消耗任何事务 id，不留半接纳状态）。
+        clone = copy.deepcopy(self)
+        for seq, req in enumerate(validated):
+            clone._admit(req, request_seq=seq)
+        for seq, req in enumerate(validated):
             # _admit 内部负责自动 id 的分配与显式 id 的登记；
-            # 能走到这里的请求已通过全部校验，接纳过程不会再失败。
-            reports.append(self._admit(req))
+            # 能走到这里的请求已通过全部校验与容量预演，接纳不会再失败。
+            reports.append(self._admit(req, request_seq=seq))
         return reports
 
     def _alloc_txn(self) -> int:
@@ -432,7 +587,61 @@ class CacheCoherenceKernel:
         self._next_txn += 1
         return tid
 
-    def _admit(self, req: Request) -> RequestReport:
+    def _check_core_cap(self, core: int,
+                        request_seq: Optional[int]) -> None:
+        cap = self._cap.core_request_cap
+        if cap is None:
+            return
+        used = self._core_inflight(core)
+        # 新请求将占一个在途槽位（活动事务或等待队列）。
+        if used + 1 > cap:
+            raise CapacityExceededError(
+                f"核 {core} 的在途请求数已达上限（{used}/{cap}），"
+                f"新请求被拒绝；待已有事务完成释放槽位后可用相同参数重试",
+                field="core_inflight", limit=cap, used=used,
+                request_seq=request_seq)
+
+    def _would_complete_synchronously(self, req: Request,
+                                      entry: _DirEntry) -> bool:
+        """预判请求在地址空闲时是否无需任何消息即可同步完成。
+
+        必须与 _start 的分支严格一致（同步完成的请求不占在途槽位，
+        因此 core_request_cap=0 时仍允许命中类请求）。
+        """
+        if req.op is Op.LOAD:
+            if entry.state is State.MODIFIED:
+                return entry.owner == req.core
+            # 目录 I/S：S 命中或从内存填 S 都在调用内完成。
+            return True
+        # STORE
+        if entry.state is State.MODIFIED:
+            return entry.owner == req.core
+        if entry.state is State.INVALID:
+            return True
+        targets = set(entry.sharers)
+        targets.discard(req.core)
+        return not targets
+
+    def _admit(self, req: Request, *,
+               request_seq: Optional[int] = None) -> RequestReport:
+        entry = self._dir[req.addr]
+        busy = entry.txn is not None or bool(entry.queue)
+        # 容量检查先于任何状态修改（先于事务 id 分配）：被拒绝时零变更、
+        # 不消耗 id，调用方释放容量后可用相同请求重试。
+        if busy:
+            cap = self._cap.dir_queue_cap
+            if cap is not None and len(entry.queue) >= cap:
+                raise CapacityExceededError(
+                    f"地址 {req.addr} 的目录等待队列已满"
+                    f"（{len(entry.queue)}/{cap}），新请求被拒绝；待队首事务"
+                    f"完成并让出队列槽位后可重试",
+                    field="dir_queue", limit=cap, used=len(entry.queue),
+                    request_seq=request_seq)
+            self._check_core_cap(req.core, request_seq)
+        elif not self._would_complete_synchronously(req, entry):
+            # 地址空闲但该请求需要发消息（成为活动事务）：占一个在途槽位。
+            self._check_core_cap(req.core, request_seq)
+
         if req.txn_id is None:
             req = Request(req.core, req.addr, req.op, req.value,
                           self._alloc_txn())
@@ -443,8 +652,7 @@ class CacheCoherenceKernel:
             self._used_txn.add(req.txn_id)
             if req.txn_id >= self._next_txn:
                 self._next_txn = req.txn_id + 1
-        entry = self._dir[req.addr]
-        if entry.txn is not None or entry.queue:
+        if busy:
             entry.queue.append(req)
             return RequestReport(req.txn_id, True, ())
         completions = self._start(req, entry)
@@ -540,11 +748,42 @@ class CacheCoherenceKernel:
 
     def _send(self, mtype: MsgType, src: int, dst: int, addr: int,
               txn_id: int, value: Optional[int] = None) -> int:
+        """产生一条消息。
+
+        网络通道（待发队列）未满：消息进入待发队列；已满：消息进入 blocked
+        FIFO 暂存区 **保留**（不丢、事务保持未完成），等槽位释放后由
+        _release_blocked / retry_blocked 按 FIFO 补发。两种情况下都返回
+        已分配的 msg_id。
+        """
         msg_id = self._next_msg
         self._next_msg += 1
-        self._pending[msg_id] = Message(
-            msg_id, txn_id, mtype, src, dst, addr, value)
+        msg = Message(msg_id, txn_id, mtype, src, dst, addr, value)
+        cap = self._cap.network_cap
+        if cap is not None and len(self._pending) >= cap:
+            self._blocked.append(msg)
+        else:
+            self._pending[msg_id] = msg
         return msg_id
+
+    def _release_blocked(self) -> list[Message]:
+        """通道有空位时，把 blocked 队首消息按 FIFO 补进待发队列。"""
+        cap = self._cap.network_cap
+        released: list[Message] = []
+        if cap is None:
+            return released
+        while self._blocked and len(self._pending) < cap:
+            msg = self._blocked.pop(0)
+            self._pending[msg.msg_id] = msg
+            released.append(msg)
+        return released
+
+    def retry_blocked(self) -> tuple[Message, ...]:
+        """显式尝试把 blocked 消息补发到待发队列。
+
+        通常无需调用：每次 deliver 腾出通道槽位后内核已自动补发。仅当外部
+        以其它方式释放了容量预期时用于手动驱动；返回本次实际补发的消息。
+        """
+        return tuple(self._release_blocked())
 
     def deliver(self, what: Union[int, Message]) -> DeliveryReport:
         """显式网络投递。
@@ -557,9 +796,12 @@ class CacheCoherenceKernel:
         - 正常消息生效并从待发队列移除；
         - 同一 msg_id 重复投递：IGNORED_DUPLICATE，幂等无副作用；
         - 报文属于已结束/其他事务（典型：陈旧 INV_ACK/FLUSH）：
-          IGNORED_STALE，不推进当前新事务；
+          IGNORED_STALE，不推进当前新事务（但仍消耗自身所占通道槽位，
+          因而可能触发 blocked 消息补发）；
         - msg_id 从不存在：InvalidMessageError；
         - 注入消息引用从未注册的 txn_id、或字段非法：InvalidMessageError。
+        - 网络通道已满时，新产生的消息进 blocked 暂存（报告 blocked 字段），
+          不报错、不丢失；投递腾出槽位后自动补发（报告 released 字段）。
 
         失败不留部分变更：所有有效性判定在任何状态修改之前完成。
         """
@@ -575,23 +817,35 @@ class CacheCoherenceKernel:
             msg = self._pending.get(what)
             if msg is None:
                 raise InvalidMessageError(
-                    f"msg_id={what} 既不在待发队列也无投递历史", msg_id=what)
+                    f"msg_id={what} 既不在待发队列也无投递历史"
+                    + ("（该 id 的消息仍在 blocked 暂存区，需先释放通道槽位）"
+                       if any(m.msg_id == what for m in self._blocked)
+                       else ""),
+                    msg_id=what)
             injected = False
 
-        before = set(self._pending)
+        id0 = self._next_msg
         done: list[Completion] = []
         stale_reason = self._apply(msg, done)
-        new_msgs = tuple(m for i, m in self._pending.items() if i not in before)
+        new_ids = set(range(id0, self._next_msg))
         if not injected:
+            # 有效性判定已通过，此刻才把被投递消息移出通道、记入历史。
             del self._pending[msg.msg_id]
             self._history[msg.msg_id] = msg
+        moved = self._release_blocked()
+        # released 只统计“本次之前就被背压”的旧消息（id < id0）；本次新产生
+        # 且当场进入待发队列的消息计入 emitted，三类字段互不重叠。
+        released = tuple(m for m in moved if m.msg_id not in new_ids)
         if stale_reason is not None:
             return DeliveryReport(
                 msg.msg_id, msg.txn_id, DeliveryStatus.IGNORED_STALE,
-                stale_reason, (), ())
+                stale_reason, (), (), (), released)
+        emitted = tuple(self._pending[i] for i in sorted(new_ids)
+                        if i in self._pending)
+        now_blocked = tuple(m for m in self._blocked if m.msg_id in new_ids)
         return DeliveryReport(
             msg.msg_id, msg.txn_id, DeliveryStatus.APPLIED, None,
-            new_msgs, tuple(done))
+            emitted, tuple(done), now_blocked, released)
 
     # -- 注入消息校验 -------------------------------------------------------
 

@@ -57,6 +57,34 @@ class InvalidMessageError(KernelError):
         super().__init__(message + suffix)
 
 
+class CapacityExceededError(KernelError):
+    """容量上限被触及：目录等待队列已满，或某核在途请求数已达上限。
+
+    与网络通道的背压语义区分：网络通道满时内核 **不抛错**，而是把消息
+    保留在 blocked 暂存区、事务保持未完成，腾出槽位后自动补发；本异常只
+    用于请求准入阶段——参数本身合法，但内核此刻没有容量接纳该请求。
+    被拒绝的请求不产生任何部分变更（不分配/不消耗事务 id），调用方在有
+    事务完成、容量释放后可用相同参数重试。
+
+    属性:
+        field:       触及的容量名："dir_queue" / "core_inflight"。
+        limit:       容量上限（None 表示无限，此时本异常不应出现）。
+        used:        拒绝发生时的已用量。
+        request_seq: 批量准入时该请求在批次中的序号（单请求为 None）。
+    """
+
+    def __init__(self, message: str, *, field: str, limit: int, used: int,
+                 request_seq: int | None = None) -> None:
+        self.field = field
+        self.limit = limit
+        self.used = used
+        self.request_seq = request_seq
+        loc = [f"field={field!r}", f"used={used}", f"limit={limit}"]
+        if request_seq is not None:
+            loc.append(f"request_seq={request_seq}")
+        super().__init__(f"{message} [{', '.join(loc)}]")
+
+
 class BudgetExhaustedError(KernelError):
     """有界搜索的交付步数预算耗尽（没证明任何东西，只是没搜完）。
 

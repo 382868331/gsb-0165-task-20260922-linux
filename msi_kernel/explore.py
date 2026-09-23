@@ -79,6 +79,12 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
         (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value)
         for m in snap.pending_messages
     ))
+    # blocked（因网络通道满而保留）同样进入指纹：一条消息在 pending 还是
+    # blocked 是不同的可达状态，不能被结构去重错误合并。
+    blocked = tuple(sorted(
+        (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value)
+        for m in snap.blocked_messages
+    ))
     queues = tuple(
         tuple((q.txn_id, q.core, q.op.value, q.value) for q in qq)
         for qq in snap.queues
@@ -86,7 +92,7 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     completed = tuple(
         (c.txn_id, c.op.value, c.value) for c in snap.completed
     )
-    return caches, directory, snap.memory, pend, queues, completed
+    return caches, directory, snap.memory, pend, blocked, queues, completed
 
 
 def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
@@ -135,6 +141,31 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
                 return f"addr={a}: 目录 I 但 owner={d.owner} 非空"
             if any(s is not State.INVALID for s in states.values()):
                 return f"addr={a}: 目录 I 却存在非 I 缓存"
+    # 容量不变量：
+    # 6. 待发报文数不得超过网络通道上限；
+    # 7. blocked 非空时，待发队列必须恰好处于满载（否则 blocked 早该自动补发），
+    #    二者总量不得超过网络上限 + blocked 自身（blocked 是“保留但未入队”）；
+    # 8. 每地址等待队列长度不得超过目录队列上限；每核在途请求数不得超过其上限。
+    cap = snap.capacity
+    if cap is not None:
+        n_pending = len(snap.pending_messages)
+        n_blocked = len(snap.blocked_messages)
+        if cap.config.network_cap is not None:
+            if n_pending > cap.config.network_cap:
+                return (f"待发报文 {n_pending} 超过网络通道上限 "
+                        f"{cap.config.network_cap}")
+            if n_blocked and n_pending != cap.config.network_cap:
+                return (f"blocked 非空（{n_blocked}）但待发队列未满载"
+                        f"（{n_pending}/{cap.config.network_cap}），"
+                        f"blocked 消息应当已被自动补发")
+        for a, qlen in enumerate(cap.dir_queues):
+            c = cap.config.dir_queue_cap
+            if c is not None and qlen > c:
+                return f"addr={a}: 等待队列 {qlen} 超过上限 {c}"
+        for core, n in enumerate(cap.core_inflight):
+            c = cap.config.core_request_cap
+            if c is not None and n > c:
+                return f"核 {core}: 在途请求 {n} 超过上限 {c}"
     return None
 
 
@@ -160,6 +191,15 @@ def drain(kernel: CacheCoherenceKernel, *, budget: int = 100_000) -> tuple[Compl
     while True:
         pend = kernel.pending()
         if not pend:
+            if kernel.blocked():
+                # 待发队列空但仍有消息被背压：没有任何可投递报文能腾出槽位，
+                # 协议无法继续（network_cap>=1 的正常配置不会出现；典型为
+                # network_cap=0 且事务必须发消息）。这不是预算问题，明确报错。
+                raise InfeasibleError(
+                    f"drain 无法继续：待发队列为空但仍有 "
+                    f"{len(kernel.blocked())} 条 blocked 消息（通道容量 "
+                    f"{kernel.capacity_config.network_cap} 不足以容纳任何"
+                    f"在途报文）")
             return tuple(kernel.completed())
         steps += 1
         if steps > budget:
@@ -202,7 +242,8 @@ def explore(factory: KernelFactory, scenario: Scenario = (), *,
 
     def note_terminal(k: CacheCoherenceKernel, path: tuple[int, ...]) -> None:
         schedules[path] = k.completed()
-        terminal_fps.add(descriptor(k)[:5])
+        # 终态指纹取除 completed 外的全部结构分量（含 blocked）。
+        terminal_fps.add(descriptor(k)[:-1])
         for comp in k.completed():
             if comp.op is Op.LOAD:
                 read_values.setdefault(comp.txn_id, set()).add(comp.value)
@@ -216,7 +257,9 @@ def explore(factory: KernelFactory, scenario: Scenario = (), *,
         bad = check_invariants(k)
         if bad is not None:
             violations.append(Violation(path, bad))
-        if not k.pending():
+        # 终态：待发队列与 blocked 暂存区都空（blocked 非空说明通道仍满、
+        # 尚有消息未入队，事务不可能全部完成）。
+        if not k.pending() and not k.blocked():
             note_terminal(k, path)
             return
         for m in k.pending():
@@ -230,7 +273,7 @@ def explore(factory: KernelFactory, scenario: Scenario = (), *,
             elif fp not in visited:
                 visited.add(fp)
                 recurse(child, new_path)
-            elif not child.pending():
+            elif not child.pending() and not child.blocked():
                 # 等价终态经由不同消息排列再次到达，仍记录其完成读值。
                 note_terminal(child, new_path)
 
@@ -268,7 +311,8 @@ def find_schedule(factory: KernelFactory, scenario: Scenario = (), *,
         if used > budget:
             raise BudgetExhaustedError(
                 "find_schedule 状态预算耗尽", budget=budget, used=used)
-        if goal(k) and (not want_complete or not k.pending()):
+        if goal(k) and (not want_complete
+                        or (not k.pending() and not k.blocked())):
             return path
         for m in k.pending():
             child = _clone(k)

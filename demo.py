@@ -13,6 +13,9 @@ import time
 from msi_kernel import (
     DIR,
     CacheCoherenceKernel,
+    CapacityConfig,
+    CapacityExceededError,
+    InfeasibleError,
     InvalidMessageError,
     InvalidRequestError,
     Message,
@@ -187,6 +190,105 @@ def part_c_boundaries():
         print(f"  5) 投递从不存在的 msg_id: {type(e).__name__}: {e}")
 
 
+def part_d_capacity():
+    print("=" * 72)
+    print("D. 容量上限：网络通道背压 + 目录/核容量拒绝（真实计算）")
+    print("=" * 72)
+    # 网络通道 cap=1：任一时刻待发队列最多 1 条，多发的进 blocked 保留。
+    print("  D1. 网络通道 network_cap=1：3 核共享后升级，INV 发送失败被保留")
+    k = CacheCoherenceKernel(memory={ADDR: 100}, network_cap=1)
+    for c in range(3):
+        k.request(c, ADDR, Op.LOAD)
+    k.request(1, ADDR, Op.STORE, value=200)
+    s = k.snapshot()
+    print(f"      待发 {[(m.mtype.value, f'->{m.dst}') for m in s.pending_messages]}"
+          f"  blocked {[(m.mtype.value, f'->{m.dst}') for m in s.blocked_messages]}"
+          f"（事务未完成、消息不丢）")
+    assert [(m.dst) for m in s.pending_messages] == [0]
+    assert [(m.dst) for m in s.blocked_messages] == [2]
+
+    # 逐步投递：每次腾出 1 槽，blocked 队首自动补发，新 ACK 又被背压。
+    # 精确轨迹：INV0 ->(补发 INV2)；INV2 ->(补发 ACK0)；ACK0 ->(补发 ACK2)；ACK2 提交。
+    for _ in range(4):
+        mid = k.pending()[0].msg_id
+        rep = k.deliver(mid)
+        print(f"      deliver {mid}: blocked 新增 "
+              f"{[m.mtype.value for m in rep.blocked]}，自动补发 "
+              f"{[(m.mtype.value, f'->{m.dst}') for m in rep.released]}，"
+              f"完成 {[(c.op.value, c.value) for c in rep.completions]}")
+    print(f"      => store 最终读值 {k.completed()[-1].value}，blocked 残留 "
+          f"{len(k.blocked())} 条")
+    assert k.completed()[-1].value == 200 and not k.blocked()
+
+    print("  D2. 目录等待队列 dir_queue_cap=1：满队列拒绝，释放后同请求重试")
+    kq = CacheCoherenceKernel(dir_queue_cap=1)
+    kq.request(0, ADDR, Op.STORE, value=7)     # M
+    kq.request(1, ADDR, Op.LOAD)               # 活动 FETCH
+    kq.request(2, ADDR, Op.LOAD)               # 排队 (1/1)
+    try:
+        kq.request(0, ADDR, Op.LOAD)           # 队列已满 -> 拒绝
+    except CapacityExceededError as e:
+        print(f"      被拒绝: {type(e).__name__} field={e.field} "
+              f"used={e.used} limit={e.limit}（不留半更新、不消耗事务 id）")
+    drain(kq)
+    rep = kq.request(0, ADDR, Op.LOAD)         # 释放后重试成功
+    drain(kq)
+    print(f"      释放后重试成功，读值 {rep.completions[0].value}（回写内存=7）")
+    assert rep.completions[0].value == 7
+
+    print("  D3. 每核在途 core_request_cap=1：异步请求占槽，命中类请求不占槽")
+    kc = CacheCoherenceKernel(core_request_cap=1)
+    kc.request(0, ADDR, Op.STORE, value=7)
+    kc.request(1, ADDR, Op.LOAD)               # 核1 活动 (1/1)
+    kc.request(0, 1, Op.STORE, value=5)        # 核0 在 addr1 为 M
+    try:
+        kc.request(1, 1, Op.LOAD)              # 核1 再读 addr1 的 M -> 在途将达 2
+    except CapacityExceededError as e:
+        print(f"      被拒绝: field={e.field} used={e.used} limit={e.limit}")
+    rep = kc.request(1, 2, Op.STORE, value=8)  # I->M 同步完成，不占在途槽
+    print(f"      核1 对空闲地址 I->M 同步写仍被允许，值 {rep.completions[0].value}")
+    assert rep.completions[0].value == 8
+
+    print("  D4. network_cap=0 边界：必须发消息时彻底无槽，drain 明确报错")
+    kz = CacheCoherenceKernel(network_cap=0)
+    kz.request(0, ADDR, Op.STORE, value=1)     # 同步
+    kz.request(1, ADDR, Op.LOAD)               # FETCH 进 blocked，pending 空
+    try:
+        drain(kz)
+    except InfeasibleError as e:
+        print(f"      {type(e).__name__}: {e}")
+    assert [m.mtype for m in kz.blocked()] == [MsgType.FETCH]
+
+    print("  D5. 2 核 2 地址：紧容量下读值与无容量旧模型逐事务一致（枚举核对）")
+    scenario = [
+        Request(0, 0, Op.STORE, value=11),
+        Request(0, 1, Op.STORE, value=22),
+        Request(1, 0, Op.LOAD),
+        Request(1, 1, Op.LOAD),
+        Request(1, 0, Op.STORE, value=33),
+        Request(0, 1, Op.LOAD),
+    ]
+    cap = CapacityConfig(network_cap=1, dir_queue_cap=1, core_request_cap=2)
+    kcap = CacheCoherenceKernel(capacity=cap)
+    for req in scenario:                       # 边推进边准入：请求与回写交错
+        while True:
+            try:
+                kcap.request(req.core, req.addr, req.op, value=req.value)
+                break
+            except CapacityExceededError:
+                p = kcap.pending()
+                kcap.deliver(p[0].msg_id)
+    drain(kcap)
+    loads = [(c.addr, c.value) for c in kcap.completed() if c.op is Op.LOAD]
+    kuncap = CacheCoherenceKernel()
+    kuncap.request_batch(scenario)
+    drain(kuncap)
+    same = ([c.value for c in kcap.completed()]
+            == [c.value for c in kuncap.completed()])
+    print(f"      紧容量完成读值序列 {loads}；与无容量模型逐事务一致: {same}")
+    assert loads == [(0, 11), (1, 22), (1, 22)] and same
+
+
 def main():
     t0 = time.perf_counter()
     part_a_invalidation_chain()
@@ -194,6 +296,8 @@ def main():
     part_b_enumeration()
     print()
     part_c_boundaries()
+    print()
+    part_d_capacity()
     dt = time.perf_counter() - t0
     print("=" * 72)
     print(f"演示结束，实际计算耗时 {dt:.2f} 秒（无 sleep、无网络、无预录结果）。")
