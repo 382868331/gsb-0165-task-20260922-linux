@@ -71,7 +71,7 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     )
     directory = tuple(
         (d.state.value, d.sharers, d.owner, d.active_txn,
-         d.awaiting_flush, d.awaiting_acks)
+         d.phase, d.awaiting_acks)
         for d in snap.directory
     )
     # 待发消息只按“类型/源/目的/地址/事务”的多重集计，与具体 id 无关。

@@ -5,7 +5,10 @@
 内容：
   A. 失效链逐步演示：3 核共享 -> 升级等齐 ACK -> 读 M 触发回写后共享；
   B. 枚举小规模消息重排，逐状态检查“至多一个 M、M 时无 S”；
-  C. 实际触发的拒绝/异常边界（NaN、bool、未知 msg_id、重复/陈旧投递）。
+  C. 实际触发的拒绝/异常边界（NaN、bool、未知 msg_id、重复/陈旧投递）；
+  D. evict 逐出演示：S 行移除共享者、M 行回写后才转 I、I 行无操作，
+     与第三核 load/升级的 FIFO 关系，以及旧 ACK/FLUSH 迟到不推进新事务，
+     并枚举重点交错的全部短消息排列。
 """
 
 import time
@@ -187,6 +190,104 @@ def part_c_boundaries():
         print(f"  5) 投递从不存在的 msg_id: {type(e).__name__}: {e}")
 
 
+def part_d_eviction():
+    print("=" * 72)
+    print("D. evict(core, addr) 显式逐出：模拟有限缓存容量的替换")
+    print("=" * 72)
+
+    # --- D1: I 行无操作；S 行通知目录移除共享者 -----------------------------
+    print("  D1) S 行逐出：核端自行置 I，目录在 EVICT 投递时才移除共享者")
+    k = CacheCoherenceKernel(memory={ADDR: 100})
+    k.request_batch([Request(0, ADDR, Op.LOAD),
+                     Request(1, ADDR, Op.LOAD),
+                     Request(2, ADDR, Op.LOAD)])
+    rep_i = k.evict(2, ADDR + 1)            # 该地址核2 从未持有：I 行
+    print(f"     逐出一条 I 行：同步完成 {[(c.op.value) for c in rep_i.completions]}，"
+          f"待发消息 {len(k.pending())} 条（无操作）")
+    rep = k.evict(0, ADDR)
+    print(f"     逐出核0 的 S 行：句柄立即返回但完成数={len(rep.completions)}"
+          f"（EVICT/ACK 未投递，不能报告完成）")
+    print_status(k, "核0 已自行置 I；目录共享者暂仍含核0（通知在途）")
+    assert k.snapshot().caches[0][ADDR].state is State.INVALID
+    ev = next(m for m in k.pending() if m.mtype is MsgType.EVICT)
+    rep = deliver_and_show(k, ev.msg_id, "EVICT 到目录")
+    print(f"     目录移除共享者 -> {list(k.snapshot().directory[ADDR].sharers)}")
+    ack = next(m for m in rep.emitted if m.mtype is MsgType.EVICT_ACK)
+    deliver_and_show(k, ack.msg_id, "EVICT_ACK 回核0，逐出完成")
+
+    # --- D2: M 行必须先回写最新数据 ----------------------------------------
+    print("  D2) M 行逐出：最新数据必须 FLUSH 交回目录，ACK 后才转 I")
+    k = CacheCoherenceKernel(memory={ADDR: 100})
+    k.request(0, ADDR, Op.STORE, value=555)
+    rep = k.evict(0, ADDR)                  # 先准入逐出（txn2，FLUSH 在途）
+    queued = k.request(2, ADDR, Op.LOAD)    # 与逐出同地址：排在逐出后面
+    print(f"     store=555（内存仍 100）；evict 返回完成数={len(rep.completions)}；"
+          f"随后第三核 load queued={queued.queued}")
+    flush = next(m for m in k.pending() if m.mtype is MsgType.FLUSH)
+    print(f"     待发 FLUSH 携带最新数据 {flush.value}；此刻内存="
+          f"{k.snapshot().memory[ADDR]}，目录 owner={k.snapshot().directory[ADDR].owner}")
+    rep = deliver_and_show(k, flush.msg_id, "FLUSH 到目录（回写入账）")
+    s = k.snapshot()
+    print(f"     入账后内存={s.memory[ADDR]}，目录={s.directory[ADDR].state.value}，"
+          f"本次完成={[c.op.value for c in rep.completions]}（ACK 未到，逐出仍未完成）")
+    ack = next(m for m in rep.emitted if m.mtype is MsgType.EVICT_ACK)
+    rep = deliver_and_show(k, ack.msg_id, "EVICT_ACK 到核0")
+    print(f"     链式完成: {[(c.op.value, c.value) for c in rep.completions]}"
+          f"（逐出完成后排队的 load 才启动，读到回写值）")
+
+    # --- D3: 旧逐出 FLUSH 迟到，不能清掉后来重新获得的 M 所有权 -------------
+    print("  D3) 旧事务身份的迟到消息：不推进新所有权")
+    k.request(0, ADDR, Op.STORE, value=888)   # 核0 想重新获得 M（先失效核2）
+    drain(k)
+    print_status(k, "核0 重新升级为 M=888（目录 owner=核0，内存停在 555）")
+    assert k.snapshot().directory[ADDR].owner == 0
+    stale = k.deliver(Message(None, 2, MsgType.FLUSH, src=0, dst=DIR,
+                              addr=ADDR, value=555))
+    print(f"     旧逐出事务(txn2) 的 FLUSH 迟到: status={stale.status.value}，"
+          f"owner 仍为 {k.snapshot().directory[ADDR].owner}，"
+          f"内存仍 {k.snapshot().memory[ADDR]}")
+    stale_ack = k.deliver(Message(None, 2, MsgType.EVICT_ACK,
+                                  src=DIR, dst=0, addr=ADDR))
+    print(f"     旧 EVICT_ACK 迟到: status={stale_ack.status.value}，"
+          f"核0 仍为 {k.snapshot().caches[0][ADDR].state.value}")
+
+    # --- D4: 重点交错的短消息排列枚举（有明确规模上限） --------------------
+    print("  D4) 枚举重点交错（固定小场景，all_paths 保留全部原始排列）")
+    # 场景一：M 逐出同时第三核 load（同地址 FIFO：消息 2 条，排列极少）。
+    scn1 = [Request(0, ADDR, Op.STORE, value=555),
+            Request(0, ADDR, Op.EVICT),
+            Request(2, ADDR, Op.LOAD)]
+    r1 = explore(lambda: CacheCoherenceKernel(memory={ADDR: 100}), scn1,
+                 all_paths=True)
+    print(f"     [M逐出 撞 第三核load] 完整排列 {len(r1.schedules)} 条，"
+          f"访问状态 {r1.steps}，违例 {len(r1.violations)}，"
+          f"load 读值集合 {[sorted(v) for v in r1.read_values.values()]}")
+    # 场景二：地址0 的 S 逐出 与 地址1 的升级（独立地址，消息 4 条可交错）。
+    scn2 = [Request(0, 0, Op.LOAD),
+            Request(1, 1, Op.LOAD), Request(2, 1, Op.LOAD),
+            Request(0, 0, Op.EVICT),
+            Request(2, 1, Op.STORE, value=8)]
+    r2 = explore(lambda: CacheCoherenceKernel(memory={0: 0, 1: 0}), scn2,
+                 all_paths=True)
+    print(f"     [S逐出 撞 他址升级] 完整排列 {len(r2.schedules)} 条，"
+          f"访问状态 {r2.steps}，违例 {len(r2.violations)}，"
+          f"预算耗尽 {r2.exhausted}")
+    # 逐步核对：任一排他调度的每一步至多一个 M 且目录 owner 一致。
+    bad_step = 0
+    for path in r2.schedules:
+        kk = CacheCoherenceKernel(memory={0: 0, 1: 0})
+        kk.request_batch(scn2)
+        for mid in path:
+            kk.deliver(mid)
+            snap = kk.snapshot()
+            for a in (0, 1):
+                ms = [c for c in range(3)
+                      if snap.caches[c][a].state is State.MODIFIED]
+                if len(ms) > 1 or (ms and snap.directory[a].owner != ms[0]):
+                    bad_step += 1
+    print(f"     逐消息步核对（最多一个 M、M 核即目录 owner）违例步数: {bad_step}")
+
+
 def main():
     t0 = time.perf_counter()
     part_a_invalidation_chain()
@@ -194,6 +295,8 @@ def main():
     part_b_enumeration()
     print()
     part_c_boundaries()
+    print()
+    part_d_eviction()
     dt = time.perf_counter() - t0
     print("=" * 72)
     print(f"演示结束，实际计算耗时 {dt:.2f} 秒（无 sleep、无网络、无预录结果）。")

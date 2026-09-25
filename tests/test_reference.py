@@ -32,7 +32,8 @@ from reference import (
 
 # 独立期望值：只吃“请求序列 + 初值”，不碰内核。
 # 规则（参考模型，非被测代码）：同地址操作严格按准入顺序完成；
-# load 读该地址当前值，store v 把当前值置为 v。
+# load 读该地址当前值，store v 把当前值置为 v，evict 不产生读值也不改值
+# （M 行逐出的脏数据回写已在协议上先于逐出完成入账）。
 def expected_values_by_txn(scenario, init_memory=None, num_addrs=8):
     mem = [0] * num_addrs
     if init_memory:
@@ -43,8 +44,9 @@ def expected_values_by_txn(scenario, init_memory=None, num_addrs=8):
     for idx, req in enumerate(scenario):
         if req.op is Op.LOAD:
             allowed[idx + 1] = mem[req.addr]
-        else:
+        elif req.op is Op.STORE:
             mem[req.addr] = req.value
+        # EVICT 不进入 allowed（没有读值），也不改 mem。
     return allowed
 
 
@@ -67,6 +69,26 @@ def make_scenario(rng, length, addr_span=8):
         addr = next(rng) % addr_span
         is_store = (next(rng) % 2) == 0
         if is_store:
+            value = 1000 + (next(rng) % 100)
+            reqs.append(Request(core, addr, Op.STORE, value=value))
+        else:
+            reqs.append(Request(core, addr, Op.LOAD))
+    return reqs
+
+
+def make_scenario_with_evictions(rng, length, addr_span=2):
+    """含逐出的场景生成（确定性 LCG）：约 1/4 操作为 evict。
+
+    逐出核可能当前并不持有该行（I 行无操作），这同样是合法输入。
+    """
+    reqs = []
+    for _ in range(length):
+        core = next(rng) % 3
+        addr = next(rng) % addr_span
+        kind = next(rng) % 4
+        if kind == 0:
+            reqs.append(Request(core, addr, Op.EVICT))
+        elif kind == 1:
             value = 1000 + (next(rng) % 100)
             reqs.append(Request(core, addr, Op.STORE, value=value))
         else:
@@ -140,6 +162,61 @@ class TestAgainstIndependentReference(unittest.TestCase):
                 self.assertEqual(by_txn[tid].value, want,
                                  f"case {case} txn {tid}")
             check_completion_sequence(flat(k.completed()), init)
+
+    def test_eviction_scenarios_fifo_drain_against_reference(self):
+        # 含逐出的场景：drain 后每个事务恰好完成一次；load 读值与参考一致；
+        # evict 完成事件被参考机跳过（不改内存口径）。
+        rng = _lcg(20260925)
+        for case in range(120):
+            init = make_memory(rng, addr_span=2)
+            scenario = make_scenario_with_evictions(rng, 12, addr_span=2)
+            allowed = expected_values_by_txn(scenario, init, num_addrs=2)
+            k = CacheCoherenceKernel(memory=dict(init))
+            k.request_batch(scenario)
+            drain(k)
+            by_txn = {}
+            for c in k.completed():
+                self.assertNotIn(c.txn_id, by_txn,
+                                 f"case {case}: txn {c.txn_id} 重复完成")
+                by_txn[c.txn_id] = c
+            # 每个请求事务（含全部 evict）都必须完成。
+            self.assertEqual(sorted(by_txn),
+                             list(range(1, len(scenario) + 1)),
+                             f"case {case}: 有事务未完成")
+            for idx, req in enumerate(scenario):
+                tid = idx + 1
+                if req.op is Op.EVICT:
+                    self.assertEqual(by_txn[tid].op.value, "evict",
+                                     f"case {case} txn {tid}")
+                elif req.op is Op.LOAD:
+                    self.assertEqual(by_txn[tid].value, allowed[tid],
+                                     f"case {case} txn {tid}")
+            check_completion_sequence(flat(k.completed()), init, num_addrs=2)
+
+    def test_eviction_scenarios_shuffled_deliveries(self):
+        # 含逐出的乱序驱动：每一步在待发消息中确定性任选；读值仍唯一，
+        # 且全部事务都能推进到完成（协议无死锁）。
+        rng = _lcg(7777)
+        for case in range(60):
+            init = make_memory(rng, addr_span=2)
+            scenario = make_scenario_with_evictions(rng, 10, addr_span=2)
+            allowed = expected_values_by_txn(scenario, init, num_addrs=2)
+            k = CacheCoherenceKernel(memory=dict(init))
+            k.request_batch(scenario)
+            steps = 0
+            while True:
+                pend = k.pending()
+                if not pend:
+                    break
+                steps += 1
+                self.assertLess(steps, 10_000, f"case {case}: 疑似死锁")
+                k.deliver(pend[next(rng) % len(pend)].msg_id)
+            by_txn = {c.txn_id: c for c in k.completed()}
+            self.assertEqual(len(by_txn), len(scenario), f"case {case}")
+            for tid, want in allowed.items():
+                self.assertEqual(by_txn[tid].value, want,
+                                 f"case {case} txn {tid}")
+            check_completion_sequence(flat(k.completed()), init, num_addrs=2)
 
     def test_reference_detects_wrong_value(self):
         # 参考机自身必须能抓错值（证明它不是恒真检查）。

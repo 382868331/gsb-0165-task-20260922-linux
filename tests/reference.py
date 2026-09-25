@@ -9,6 +9,11 @@
   的最后一个 store 的写入值；此前没有 store 则为初始内存值；
 - 不同地址之间不做顺序约束。
 
+逐出（"evict"）完成事件对“最后写入”抽象机没有影响：它既不产生读值，也
+不改变内存值（M 行的最新数据在逐出事务完成前已由 FLUSH 入账，入账在完成
+序列上表现为后续 load 读到该值——该约束仍由逐完成顺序检查覆盖），因此
+参考机把它当作无操作跳过。
+
 往返一致（用核心自身快照反推）只能作为补充测试，期望值以本参考为准。
 """
 
@@ -44,6 +49,9 @@ def expected_load_values(
             mem[addr] = value
         elif op == "load":
             expected.append(mem[addr])
+        elif op == "evict":
+            # 逐出不改内存（脏数据回写的可见性已由后续 load 覆盖）。
+            continue
         else:
             raise ValueError(f"参考模型未知 op: {op!r}")
     return expected
@@ -66,6 +74,8 @@ def check_completion_sequence(
     for addr, op, value in completions:
         if op == "store":
             mem[addr] = value
+        elif op == "evict":
+            continue
         else:
             want = mem[addr]
             if value != want:
