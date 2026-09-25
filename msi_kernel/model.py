@@ -13,7 +13,10 @@
 - 目录每地址记录状态、共享者集合、M 的 owner、内存值、活动事务与 FIFO 等待队列；
 - 升级（S→M，或写他核 M）必须等齐全部失效 ACK 才提交；
 - 读处于 M 的地址：目录先 FETCH 令 owner 回写（FLUSH），再以 S 共享；
-- 同地址新请求 FIFO 排队，不同地址事务彼此独立、可并存交错。
+- evict(core, addr) 主动逐出（模拟有限缓存容量）：I 行无操作；S 行本地
+  丢弃并发 EVICT_S 请目录移除共享者；M 行本地丢弃并发 EVICT_WB 把最新
+  数据交回目录，写回未到目录前事务不完成；
+- 同地址新请求（含逐出）FIFO 排队，不同地址事务彼此独立、可并存交错。
 
 本文件只实现题面契约的有限协议子集，不宣称兼容任何工业标准缓存一致性协议。
 """
@@ -45,21 +48,26 @@ class Op(str, Enum):
 
     LOAD = "load"
     STORE = "store"
+    EVICT = "evict"
 
 
 class MsgType(str, Enum):
     """网络消息类型（目录↔核）。
 
-    FETCH:   目录 → M 的 owner，要求回写最新数据并降级为 S；
-    FLUSH:   owner → 目录，携带最新数据完成回写；
-    INV:     目录 → 某个 S 共享者，要求失效该行；
-    INV_ACK: 共享者 → 目录，失效完成确认。
+    FETCH:    目录 → M 的 owner，要求回写最新数据并降级为 S；
+    FLUSH:    owner → 目录，携带最新数据完成回写；
+    INV:      目录 → 某个 S 共享者，要求失效该行；
+    INV_ACK:  共享者 → 目录，失效完成确认；
+    EVICT_S:  核 → 目录，S 行逐出通知（本地已丢弃，请移除共享者）；
+    EVICT_WB: 核 → 目录，M 行逐出写回（携带最新数据，本地已丢弃）。
     """
 
     FETCH = "FETCH"
     FLUSH = "FLUSH"
     INV = "INV"
     INV_ACK = "INV_ACK"
+    EVICT_S = "EVICT_S"
+    EVICT_WB = "EVICT_WB"
 
 
 class DeliveryStatus(str, Enum):
@@ -77,9 +85,9 @@ class DeliveryStatus(str, Enum):
 
 @dataclass(frozen=True)
 class Request:
-    """一条 load/store 请求。
+    """一条 load/store/evict 请求。
 
-    LOAD 的 value 必须为 None；STORE 必须给 int 类型 value（bool 拒绝，
+    LOAD/EVICT 的 value 必须为 None；STORE 必须给 int 类型 value（bool 拒绝，
     float 拒绝，NaN/Infinity 给出明确报错）。
     txn_id 为 None 时内核自动分配；显式给出时必须为正整数且全生命周期唯一。
     """
@@ -96,7 +104,7 @@ class Message:
     """一条网络消息。
 
     内核生成的消息 msg_id 为正整数；调用方显式注入网络输入时 msg_id 传 None。
-    value 仅 FLUSH 使用（回写的数据，int）。
+    value 仅 FLUSH / EVICT_WB 使用（回写的数据，int）。
     """
 
     msg_id: Optional[int]
@@ -112,7 +120,9 @@ class Message:
 class Completion:
     """一个事务的完成事件。
 
-    LOAD 的 value 为实际完成读值；STORE 的 value 为写入值。
+    LOAD 的 value 为实际完成读值；STORE 的 value 为写入值；
+    EVICT 的 value 为交回目录的值（M 行写回值；S/I 行为当前内存值，
+    S 行是干净副本，其值恒等于内存值）。
     """
 
     txn_id: int
@@ -136,6 +146,8 @@ class DirectoryView:
     active_txn: Optional[int]
     awaiting_flush: bool
     awaiting_acks: tuple[int, ...]
+    # 活动事务是否为逐出（M 逐出写回在途时 owner 缓存已合法地为 I）。
+    evicting: bool = False
 
 
 @dataclass(frozen=True)
@@ -271,12 +283,17 @@ def _validate_request(req: object, *, request_seq: Optional[int]) -> Request:
     _check_addr(req.addr, request_seq=request_seq)
     if not isinstance(req.op, Op):
         raise InvalidRequestError(
-            f"op 必须是 Op.LOAD/Op.STORE，收到 {req.op!r}",
+            f"op 必须是 Op.LOAD/Op.STORE/Op.EVICT，收到 {req.op!r}",
             request_seq=request_seq, field="op")
     if req.op is Op.LOAD:
         if req.value is not None:
             raise InvalidRequestError(
                 "load 请求不能带 value（完成读值由 Completion 给出）",
+                request_seq=request_seq, field="value")
+    elif req.op is Op.EVICT:
+        if req.value is not None:
+            raise InvalidRequestError(
+                "evict 请求不能带 value（写回值取自缓存行本身）",
                 request_seq=request_seq, field="value")
     else:
         if req.value is None:
@@ -359,6 +376,7 @@ class CacheCoherenceKernel:
                 e.txn.txn_id if e.txn is not None else None,
                 bool(e.txn.awaiting_flush) if e.txn is not None else False,
                 tuple(sorted(e.txn.awaiting_acks)) if e.txn is not None else (),
+                e.txn.op is Op.EVICT if e.txn is not None else False,
             )
             for e in self._dir
         )
@@ -383,13 +401,31 @@ class CacheCoherenceKernel:
     def request(self, core: int, addr: int, op: Op, *,
                 value: Optional[int] = None,
                 txn_id: Optional[int] = None) -> RequestReport:
-        """输入一条 load/store 请求。
+        """输入一条 load/store/evict 请求。
 
         该地址有活动事务或已有排队请求时进入 FIFO 队列（queued=True）；
-        无消息即可满足的请求（I/S 命中、I 上写、独占 S 升级）在本次调用内完成。
+        无消息即可满足的请求（I/S 命中、I 上写、独占 S 升级、I 行逐出）
+        在本次调用内完成。
         """
         req = _validate_request(
             Request(core, addr, op, value, txn_id), request_seq=0)
+        return self._admit(req)
+
+    def evict(self, core: int, addr: int, *,
+              txn_id: Optional[int] = None) -> RequestReport:
+        """输入一条逐出请求，让上层模拟有限缓存容量下的主动替换。
+
+        返回待完成句柄（RequestReport）：
+        - I 行：无操作，本次调用内同步完成；
+        - S 行：本地立即丢弃为 I，并发 EVICT_S 请目录移除共享者，
+          目录收到通知前本事务不完成；
+        - M 行：本地立即丢弃为 I，最新数据随 EVICT_WB 在途，
+          写回消息未投递到目录前本事务不完成（completions 为空）。
+        逐出与读写一样纳入同地址 FIFO 事务队列；推进仍完全由显式
+        deliver 驱动，内核不直接改其他核的状态。
+        """
+        req = _validate_request(
+            Request(core, addr, Op.EVICT, None, txn_id), request_seq=0)
         return self._admit(req)
 
     def request_batch(self, requests: Iterable[Request]) -> list[RequestReport]:
@@ -457,6 +493,33 @@ class CacheCoherenceKernel:
         core, addr = req.core, req.addr
         line = self._caches[core][addr]
         done: list[Completion] = []
+
+        if req.op is Op.EVICT:
+            if line.state is State.INVALID:
+                # I 行：无操作，立即完成。
+                self._finish(req, self._memory[addr], done)
+                return done
+            if line.state is State.SHARED:
+                # S 行：本地立即丢弃，目录收到 EVICT_S 移除共享者后才完成。
+                line.state = State.INVALID
+                line.value = None
+                entry.txn = _Txn(req.txn_id, core, Op.EVICT, None,
+                                 awaiting_flush=False, awaiting_acks=set(),
+                                 flush_owner=None)
+                self._send(MsgType.EVICT_S, core, DIR, addr, req.txn_id)
+                return done
+            # M 行：本地立即丢弃，最新数据随 EVICT_WB 在途；目录收到写回、
+            # 更新内存并释放 owner 后才完成（写回在途期间目录仍 M/owner=core）。
+            assert entry.state is State.MODIFIED and entry.owner == core
+            wb_value = line.value
+            assert wb_value is not None
+            line.state = State.INVALID
+            line.value = None
+            entry.txn = _Txn(req.txn_id, core, Op.EVICT, None,
+                             awaiting_flush=True, awaiting_acks=set(),
+                             flush_owner=core)
+            self._send(MsgType.EVICT_WB, core, DIR, addr, req.txn_id, wb_value)
+            return done
 
         if req.op is Op.LOAD:
             if entry.state is State.MODIFIED and entry.owner == core:
@@ -628,7 +691,7 @@ class CacheCoherenceKernel:
                 raise InvalidMessageError(
                     f"{mtype.value} 必须 src 为核号且 dst=DIR({DIR})",
                     field="src/dst")
-        if mtype is MsgType.FLUSH:
+        if mtype is MsgType.FLUSH or mtype is MsgType.EVICT_WB:
             _check_int("value", msg.value, msg=True)
         elif msg.value is not None:
             raise InvalidMessageError(
@@ -646,8 +709,10 @@ class CacheCoherenceKernel:
 
         if msg.mtype is MsgType.FETCH:
             # 陈旧性判定先于任何状态修改：FETCH 必须对应当前“等回写”事务，
-            # 且接收方正是该事务记录的旧 owner。
+            # 且接收方正是该事务记录的旧 owner。逐出事务等的是 EVICT_WB，
+            # 不属于 FETCH 的合法对象。
             if (txn is None or txn.txn_id != msg.txn_id
+                    or txn.op is Op.EVICT
                     or not txn.awaiting_flush or txn.flush_owner != msg.dst):
                 return (f"陈旧 FETCH：属于事务 {msg.txn_id}、指向核 {msg.dst}，"
                         f"地址 {msg.addr} 当前活动事务为 "
@@ -682,6 +747,7 @@ class CacheCoherenceKernel:
 
         if msg.mtype is MsgType.FLUSH:
             if (txn is None or txn.txn_id != msg.txn_id
+                    or txn.op is Op.EVICT
                     or not txn.awaiting_flush):
                 return (f"FLUSH 属于事务 {msg.txn_id}，与地址 {msg.addr} "
                         f"当前活动事务"
@@ -711,6 +777,40 @@ class CacheCoherenceKernel:
             else:
                 for c in sorted(targets):
                     self._send(MsgType.INV, DIR, c, msg.addr, txn.txn_id)
+            return None
+
+        if msg.mtype is MsgType.EVICT_S:
+            # S 行逐出通知：必须对应当前活动的 S 逐出事务且来自逐出核本人。
+            if (txn is None or txn.txn_id != msg.txn_id
+                    or txn.op is not Op.EVICT or txn.awaiting_flush
+                    or msg.src != txn.core):
+                return (f"陈旧 EVICT_S：来自核 {msg.src}、属于事务 "
+                        f"{msg.txn_id}，地址 {msg.addr} 当前活动事务为 "
+                        f"{txn.txn_id if txn else None}，不推进新事务")
+            entry.sharers.discard(msg.src)
+            if not entry.sharers:
+                entry.state = State.INVALID
+            entry.txn = None
+            # S 行是干净副本，完成值即当前内存值。
+            self._finish(Request(txn.core, msg.addr, Op.EVICT, None,
+                                 txn.txn_id), self._memory[msg.addr], done)
+            return None
+
+        if msg.mtype is MsgType.EVICT_WB:
+            # M 行逐出写回：必须对应当前“等逐出写回”事务且来自旧 owner。
+            if (txn is None or txn.txn_id != msg.txn_id
+                    or txn.op is not Op.EVICT or not txn.awaiting_flush
+                    or msg.src != txn.flush_owner):
+                return (f"陈旧 EVICT_WB：来自核 {msg.src}、属于事务 "
+                        f"{msg.txn_id}，地址 {msg.addr} 当前活动事务为 "
+                        f"{txn.txn_id if txn else None}，不推进新事务")
+            self._memory[msg.addr] = msg.value
+            entry.state = State.INVALID
+            entry.owner = None
+            entry.sharers.clear()
+            entry.txn = None
+            self._finish(Request(txn.core, msg.addr, Op.EVICT, None,
+                                 txn.txn_id), msg.value, done)
             return None
 
         # INV_ACK

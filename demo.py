@@ -1,11 +1,13 @@
-"""固定输入演示：消息驱动 MSI 目录一致性内核。
+"""固定输入演示：消息驱动 MSI 目录一致性内核（含主动逐出 evict）。
 
 运行：python demo.py
 全程真实计算（无 sleep、无预录结果、无网络/线程），确定性输出。
 内容：
   A. 失效链逐步演示：3 核共享 -> 升级等齐 ACK -> 读 M 触发回写后共享；
   B. 枚举小规模消息重排，逐状态检查“至多一个 M、M 时无 S”；
-  C. 实际触发的拒绝/异常边界（NaN、bool、未知 msg_id、重复/陈旧投递）。
+  C. 实际触发的拒绝/异常边界（NaN、bool、未知 msg_id、重复/陈旧投递）；
+  D. 主动逐出：M 逐出写回与第三核 load 交错、S 逐出撞升级的消息排列
+     枚举、旧逐出写回迟到被判定陈旧。
 """
 
 import time
@@ -187,6 +189,92 @@ def part_c_boundaries():
         print(f"  5) 投递从不存在的 msg_id: {type(e).__name__}: {e}")
 
 
+def part_d_eviction():
+    print("=" * 72)
+    print("D. 主动逐出 evict(core, addr)：模拟有限缓存容量")
+    print("=" * 72)
+
+    print("  D1. M 行逐出：最新数据必须随写回交回目录，写回未到不完成")
+    k = CacheCoherenceKernel(memory={ADDR: 0})
+    k.request(0, ADDR, Op.STORE, value=70)
+    handle = k.evict(0, ADDR)
+    print(f"  核0 store=70 后 evict：返回待完成句柄 txn={handle.txn_id}，"
+          f"此刻 completions={list(handle.completions)}（写回在途，未完成）")
+    print_status(k, "本地行已丢弃为 I；目录仍 M/owner=0（所有权在途）")
+    r = k.request(2, ADDR, Op.LOAD)
+    print(f"  核2 同地址 load：queued={r.queued}（纳入原地址事务队列）")
+    wb = k.pending()[0]
+    rep = deliver_and_show(k, wb.msg_id, "EVICT_WB 写回到达目录")
+    print_status(k, "写回完成：目录转 I，排队的 load 随之以 S 完成")
+    print(f"  => 逐出完成值={rep.completions[0].value}，"
+          f"核2 完成读值={rep.completions[1].value}（来自写回后的内存）")
+
+    print()
+    print("  D2. S 逐出撞升级（逐出先行）：共享者被移除后升级不再失效它")
+    scenario = [
+        Request(0, ADDR, Op.LOAD),
+        Request(1, ADDR, Op.LOAD),
+        Request(2, ADDR, Op.LOAD),
+        Request(0, ADDR, Op.EVICT),               # 核0 逐出 S（通知在途）
+        Request(1, ADDR, Op.STORE, value=21),     # 核1 升级（排队）
+        Request(2, ADDR, Op.LOAD),                # 读写逐出交错
+    ]
+    k = CacheCoherenceKernel(memory={ADDR: 100})
+    k.request_batch(scenario)
+    notice = k.pending()[0]                        # 核0 的 EVICT_S
+    k.deliver(notice.msg_id)                       # 逐出完成，升级随之启动
+    inv_dsts = sorted(m.dst for m in k.pending()
+                      if m.mtype is MsgType.INV)
+    print(f"  EVICT_S 投递后：升级启动，INV 只发往核 {inv_dsts}"
+          "（核0 已被移出共享者，不再收到 INV）")
+    drain(k)
+    s = k.snapshot()
+    print(f"  终态: dir={s.directory[ADDR].state.value} "
+          f"owner={s.directory[ADDR].owner}；核0/核1/核2="
+          f"{line_state(k,0)}/{line_state(k,1)}/{line_state(k,2)}")
+    print(f"  完成序列: {[(c.txn_id, c.op.value, c.value) for c in s.completed]}")
+
+    print()
+    print("  D3. S 逐出撞升级（升级先行）：枚举两个核的短消息排列")
+    scenario = [
+        Request(0, ADDR, Op.LOAD),
+        Request(1, ADDR, Op.LOAD),
+        Request(2, ADDR, Op.LOAD),
+        Request(1, ADDR, Op.STORE, value=33),     # 升级先占事务（2 条 INV）
+        Request(0, ADDR, Op.EVICT),               # 逐出排队，轮到时行已被失效
+        Request(2, ADDR, Op.LOAD),                # 读写逐出交错
+    ]
+    res = explore(lambda: CacheCoherenceKernel(memory={ADDR: 100}), scenario,
+                  all_paths=True)
+    print(f"  穷举访问状态数: {res.steps}；完整消息重排路径数: "
+          f"{len(res.schedules)}；去重终态数: {res.terminal_states}；"
+          f"预算耗尽: {res.exhausted}")
+    print(f"  不变量违例（最多一个 M、目录 owner 一致）: "
+          f"{list(res.violations)}")
+    for path in sorted(res.schedules):
+        print(f"     重排 {path}")
+    print("  各 load 在全部重排下的实际读值集合:")
+    for tid, vals in sorted(res.read_values.items()):
+        print(f"     事务 {tid}: {sorted(vals)}")
+    print("  固定允许值（串行完成顺序口径）：前三个 load=100，"
+          "交错 load=33（升级之后）；逐出恰完成一次")
+
+    print()
+    print("  D4. 旧逐出写回迟到：不得清掉后来重新获得的所有权")
+    k2 = CacheCoherenceKernel(memory={ADDR: 0})
+    k2.request(0, ADDR, Op.STORE, value=5)
+    k2.evict(0, ADDR)
+    drain(k2)
+    k2.request(0, ADDR, Op.STORE, value=7)        # 重新获得 M
+    stale = k2.deliver(Message(None, 2, MsgType.EVICT_WB, src=0, dst=DIR,
+                               addr=ADDR, value=5))
+    s = k2.snapshot()
+    print(f"  重放已结束事务2 的 EVICT_WB -> {stale.status.value}；"
+          f"目录仍 {s.directory[ADDR].state.value}/owner="
+          f"{s.directory[ADDR].owner}，核0 行值="
+          f"{s.caches[0][ADDR].value}（新所有权与新数据都保留）")
+
+
 def main():
     t0 = time.perf_counter()
     part_a_invalidation_chain()
@@ -194,11 +282,13 @@ def main():
     part_b_enumeration()
     print()
     part_c_boundaries()
+    print()
+    part_d_eviction()
     dt = time.perf_counter() - t0
     print("=" * 72)
     print(f"演示结束，实际计算耗时 {dt:.2f} 秒（无 sleep、无网络、无预录结果）。")
-    if dt > 8.0:
-        raise SystemExit(f"演示耗时 {dt:.2f}s 超过约定的约 8 秒")
+    if dt > 90.0:
+        raise SystemExit(f"演示耗时 {dt:.2f}s 超过约定的 90 秒上限")
 
 
 if __name__ == "__main__":

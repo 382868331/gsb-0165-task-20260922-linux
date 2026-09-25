@@ -7,6 +7,8 @@
 - 地址在完成序列上存在全序（目录对同地址请求 FIFO 准入、同地址协议串行）；
 - 因此某个 load 完成时的允许值唯一确定：完成序列中该地址上、位于它之前
   的最后一个 store 的写入值；此前没有 store 则为初始内存值；
+- evict 完成事件不改变抽象内存：M 行逐出写回的恰是该地址最后存入的值，
+  S/I 行逐出不写内存，故参考机直接跳过；
 - 不同地址之间不做顺序约束。
 
 往返一致（用核心自身快照反推）只能作为补充测试，期望值以本参考为准。
@@ -44,6 +46,8 @@ def expected_load_values(
             mem[addr] = value
         elif op == "load":
             expected.append(mem[addr])
+        elif op == "evict":
+            continue  # 逐出不改变抽象内存（写回值恒等于最后存入值）
         else:
             raise ValueError(f"参考模型未知 op: {op!r}")
     return expected
@@ -66,6 +70,8 @@ def check_completion_sequence(
     for addr, op, value in completions:
         if op == "store":
             mem[addr] = value
+        elif op == "evict":
+            continue  # 逐出不改变抽象内存
         else:
             want = mem[addr]
             if value != want:

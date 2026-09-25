@@ -71,7 +71,7 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     )
     directory = tuple(
         (d.state.value, d.sharers, d.owner, d.active_txn,
-         d.awaiting_flush, d.awaiting_acks)
+         d.awaiting_flush, d.awaiting_acks, d.evicting)
         for d in snap.directory
     )
     # 待发消息只按“类型/源/目的/地址/事务”的多重集计，与具体 id 无关。
@@ -95,10 +95,12 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
     口径（对任意外部投递之间的可观测状态成立；含报文在途过渡态）：
     1. 三个核缓存中 M 至多一个；
     2. 任一缓存为 M 时，其它缓存不得为 S；
-    3. 目录 M：owner 存在，除 owner 外其它缓存必须 I
-       （FETCH 已送达而 FLUSH 未到的过渡态里 owner 可为 S）；
+    3. 目录 M：owner 存在，除 owner 外其它缓存必须 I；
+       owner 正常为 M，FETCH 已送达而 FLUSH 未到的过渡态里可为 S，
+       M 逐出写回（EVICT_WB）在途的过渡态里为 I（owner 已本地丢弃）；
     4. 目录 S：无 M 缓存，owner 为空，每个 S 缓存核都必须登记在共享者
-       集合中（允许反向：INV 已在核端生效、ACK 在途时共享者暂时多出核）；
+       集合中（允许反向：INV 已在核端生效、ACK 在途，或 S 逐出通知
+       EVICT_S 在途时，共享者暂时多出核）；
     5. 目录 I：所有缓存 I，owner 为空。
     """
     snap = kernel.snapshot()
@@ -118,9 +120,15 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
                 if c != d.owner and s is not State.INVALID:
                     return (f"addr={a}: 目录 M，非 owner 核 {c} 状态为 "
                             f"{s.value}（应为 I）")
-            if states[d.owner] not in (State.MODIFIED, State.SHARED):
+            owner_state = states[d.owner]
+            if d.evicting:
+                # M 逐出：owner 在写回发出时已本地丢弃，写回在途期间为 I。
+                if owner_state is not State.INVALID:
+                    return (f"addr={a}: M 逐出写回在途，owner 核 {d.owner} "
+                            f"状态为 {owner_state.value}（逐出后应为 I）")
+            elif owner_state not in (State.MODIFIED, State.SHARED):
                 return (f"addr={a}: 目录 M，owner 核 {d.owner} 状态为 "
-                        f"{states[d.owner].value}（应为 M 或回写在途 S）")
+                        f"{owner_state.value}（应为 M 或回写在途 S）")
         elif d.state is State.SHARED:
             if d.owner is not None:
                 return f"addr={a}: 目录 S 但 owner={d.owner} 非空"

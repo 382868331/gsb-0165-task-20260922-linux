@@ -32,7 +32,8 @@ from reference import (
 
 # 独立期望值：只吃“请求序列 + 初值”，不碰内核。
 # 规则（参考模型，非被测代码）：同地址操作严格按准入顺序完成；
-# load 读该地址当前值，store v 把当前值置为 v。
+# load 读该地址当前值，store v 把当前值置为 v；evict 不改变抽象内存
+# （M 逐出写回的恰是最后存入值，S/I 逐出不写内存）。
 def expected_values_by_txn(scenario, init_memory=None, num_addrs=8):
     mem = [0] * num_addrs
     if init_memory:
@@ -43,8 +44,9 @@ def expected_values_by_txn(scenario, init_memory=None, num_addrs=8):
     for idx, req in enumerate(scenario):
         if req.op is Op.LOAD:
             allowed[idx + 1] = mem[req.addr]
-        else:
+        elif req.op is Op.STORE:
             mem[req.addr] = req.value
+        # Op.EVICT：抽象内存不变，无允许值约束（完成存在性另行断言）。
     return allowed
 
 
@@ -65,8 +67,10 @@ def make_scenario(rng, length, addr_span=8):
     for _ in range(length):
         core = next(rng) % 3
         addr = next(rng) % addr_span
-        is_store = (next(rng) % 2) == 0
-        if is_store:
+        kind = next(rng) % 4
+        if kind == 0:
+            reqs.append(Request(core, addr, Op.EVICT))
+        elif kind <= 2:
             value = 1000 + (next(rng) % 100)
             reqs.append(Request(core, addr, Op.STORE, value=value))
         else:
@@ -114,6 +118,8 @@ class TestAgainstIndependentReference(unittest.TestCase):
                 # 同 txn 只完成一次。
                 self.assertNotIn(c.txn_id, by_txn)
                 by_txn[c.txn_id] = c
+            # 每条请求（含逐出）都恰好完成一次。
+            self.assertEqual(set(by_txn), set(range(1, len(scenario) + 1)))
             for tid, want in allowed.items():
                 self.assertIn(tid, by_txn, f"case {case}: txn {tid} 未完成")
                 self.assertEqual(by_txn[tid].value, want,
@@ -136,6 +142,7 @@ class TestAgainstIndependentReference(unittest.TestCase):
                 choice = pend[next(rng) % len(pend)]
                 k.deliver(choice.msg_id)
             by_txn = {c.txn_id: c for c in k.completed()}
+            self.assertEqual(set(by_txn), set(range(1, len(scenario) + 1)))
             for tid, want in allowed.items():
                 self.assertEqual(by_txn[tid].value, want,
                                  f"case {case} txn {tid}")
@@ -163,7 +170,8 @@ class TestExhaustiveReferenceComparison(unittest.TestCase):
             for addr in range(2):
                 ops.append((core, addr, Op.LOAD))
                 ops.append((core, addr, Op.STORE, 10 + core))
-        # 全组合 12^4=20736 太多；用 LCG 固定抽取 300 个场景。
+                ops.append((core, addr, Op.EVICT))
+        # 全组合 18^4=104976 太多；用 LCG 固定抽取 300 个场景。
         rng = _lcg(99)
         for case in range(300):
             scenario = []
@@ -181,6 +189,9 @@ class TestExhaustiveReferenceComparison(unittest.TestCase):
             self.assertEqual(res.violations, (), f"case {case}")
             for path, completions in res.schedules.items():
                 by_txn = {c.txn_id: c for c in completions}
+                # 每条请求（含逐出）都恰好完成一次。
+                self.assertEqual(set(by_txn), set(range(1, len(scenario) + 1)),
+                                 f"case {case} path {path}")
                 for tid, want in allowed.items():
                     self.assertEqual(by_txn[tid].value, want,
                                      f"case {case} path {path} txn {tid}")
