@@ -16,7 +16,10 @@ from .errors import (
 from .model import (
     NUM_CORES,
     NUM_ADDRS,
+    NUM_SECTORS,
+    ALL_SECTORS,
     DIR,
+    LineMode,
     State,
     Op,
     MsgType,
@@ -26,6 +29,9 @@ from .model import (
     Completion,
     RequestReport,
     DeliveryReport,
+    SectorCacheView,
+    SectorDirectoryView,
+    SectorTxnView,
     CacheCoherenceKernel,
 )
 from .explore import (
@@ -41,7 +47,10 @@ from .explore import (
 __all__ = [
     "NUM_CORES",
     "NUM_ADDRS",
+    "NUM_SECTORS",
+    "ALL_SECTORS",
     "DIR",
+    "LineMode",
     "State",
     "Op",
     "MsgType",
@@ -51,6 +60,9 @@ __all__ = [
     "Completion",
     "RequestReport",
     "DeliveryReport",
+    "SectorCacheView",
+    "SectorDirectoryView",
+    "SectorTxnView",
     "CacheCoherenceKernel",
     "explore",
     "find_schedule",

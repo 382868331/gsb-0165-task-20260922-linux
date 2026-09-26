@@ -22,6 +22,7 @@ from .errors import BudgetExhaustedError, InfeasibleError
 from .model import (
     NUM_ADDRS,
     NUM_CORES,
+    NUM_SECTORS,
     CacheCoherenceKernel,
     Completion,
     Op,
@@ -65,6 +66,37 @@ class ExplorationResult:
 def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     """内核状态的结构指纹（只含结构与取值，不含消息 id），用于状态去重。"""
     snap = kernel.snapshot()
+    if snap.sector_caches is not None:
+        caches = tuple(
+            tuple(
+                tuple((s.state.value, s.value, s.version) for s in lines[a])
+                for a in range(NUM_ADDRS)
+            )
+            for lines in snap.sector_caches
+        )
+        directory = tuple(
+            tuple((d.state.value, d.sharers, d.owner, d.value, d.version)
+                  for d in line)
+            for line in snap.sector_directory
+        )
+        txns = tuple(
+            tuple((t.txn_id, t.core, t.op.value, t.sectors,
+                   t.flush_waiters, t.ack_waiters) for t in line)
+            for line in snap.sector_txns
+        )
+        pend = tuple(sorted(
+            (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value, m.sectors)
+            for m in snap.pending_messages
+        ))
+        queues = tuple(
+            tuple((q.txn_id, q.core, q.op.value, q.value, q.sectors)
+                  for q in qq)
+            for qq in snap.queues
+        )
+        completed = tuple(
+            (c.txn_id, c.op.value, c.value, c.sectors) for c in snap.completed
+        )
+        return caches, directory, txns, pend, queues, completed
     caches = tuple(
         tuple((line.state.value, line.value) for line in cache.values())
         for cache in snap.caches
@@ -102,6 +134,8 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
     5. 目录 I：所有缓存 I，owner 为空。
     """
     snap = kernel.snapshot()
+    if snap.sector_caches is not None:
+        return _check_sector_invariants(snap)
     for a in range(NUM_ADDRS):
         states = {c: snap.caches[c][a].state for c in range(NUM_CORES)}
         ms = [c for c, s in states.items() if s is State.MODIFIED]
@@ -135,6 +169,57 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
                 return f"addr={a}: 目录 I 但 owner={d.owner} 非空"
             if any(s is not State.INVALID for s in states.values()):
                 return f"addr={a}: 目录 I 却存在非 I 缓存"
+    return None
+
+
+def _check_sector_invariants(snap) -> Optional[str]:
+    """四扇区模式的逐扇区结构不变量。"""
+    for a in range(NUM_ADDRS):
+        active_masks = []
+        for txn in snap.sector_txns[a]:
+            for old_txn, old_mask in active_masks:
+                if old_mask & txn.sectors:
+                    return (f"addr={a}: 活动事务 {old_txn} 与 {txn.txn_id} "
+                            f"扇区掩码重叠")
+            active_masks.append((txn.txn_id, txn.sectors))
+        for sector in range(NUM_SECTORS):
+            states = {
+                c: snap.sector_caches[c][a][sector].state
+                for c in range(NUM_CORES)
+            }
+            ms = [c for c, s in states.items() if s is State.MODIFIED]
+            ss = [c for c, s in states.items() if s is State.SHARED]
+            if len(ms) > 1:
+                return (f"addr={a} sector={sector}: 同时存在 {len(ms)} "
+                        f"个 M 缓存: {ms}")
+            if ms and ss:
+                return (f"addr={a} sector={sector}: M 缓存 {ms} 与 S 缓存 "
+                        f"{ss} 共存")
+            d = snap.sector_directory[a][sector]
+            if d.state is State.MODIFIED:
+                if d.owner is None:
+                    return f"addr={a} sector={sector}: 目录 M 但 owner 为空"
+                for c, s in states.items():
+                    if c != d.owner and s is not State.INVALID:
+                        return (f"addr={a} sector={sector}: 目录 M，非 owner "
+                                f"核 {c} 状态为 {s.value}")
+                if states[d.owner] not in (State.MODIFIED, State.SHARED):
+                    return (f"addr={a} sector={sector}: 目录 M，owner 核 "
+                            f"{d.owner} 状态为 {states[d.owner].value}")
+            elif d.state is State.SHARED:
+                if d.owner is not None:
+                    return f"addr={a} sector={sector}: 目录 S 但 owner 非空"
+                if ms:
+                    return f"addr={a} sector={sector}: 目录 S 却存在 M"
+                extra = [c for c in ss if c not in d.sharers]
+                if extra:
+                    return (f"addr={a} sector={sector}: 核 {extra} 持有 S "
+                            f"但不在目录共享者集合中")
+            else:
+                if d.owner is not None:
+                    return f"addr={a} sector={sector}: 目录 I 但 owner 非空"
+                if any(s is not State.INVALID for s in states.values()):
+                    return f"addr={a} sector={sector}: 目录 I 却存在非 I 缓存"
     return None
 
 

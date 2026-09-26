@@ -4,6 +4,11 @@
 线程、不含真实网络：load/store 请求与网络报文投递全部是显式函数调用，
 调用方决定报文投递顺序，因此同一份核心可以被确定性地驱动、重放与穷举。
 
+当前版本提供两种行粒度：默认仍是原**整行 MSI**；显式
+`mode=LineMode.FOUR_SECTOR` 时启用固定 **4 扇区缓存行**。扇区模式下，
+同一行的不同扇区拥有各自共享者、dirty owner、目录内存值与数据版本；
+不重叠扇区的事务可并行推进，重叠扇区事务严格串行。
+
 ## 运行环境
 
 - **Python 3.14.7**（仅使用标准库；3.10+ 的语法也兼容，但以 3.14.7 为准）。
@@ -14,12 +19,22 @@
 ## 准确命令
 
 ```bash
-# 必要测试（在仓库根目录执行）
+# 可选但推荐：准备隔离 venv（标准库即可，不安装第三方依赖）
+python3 -m venv .venv
+. .venv/bin/activate
+
+# 必要测试（在仓库根目录执行；无需 pip install -r requirements.txt）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.1 秒内完成，上限约定为约 8 秒）
+# 原整行模式演示（约 0.1 秒内完成，上限约定为约 8 秒）
 python demo.py
+
+# 本题四扇区增量演示（现场计算，通常约 0.3 秒，硬上限 90 秒）
+python demo_iteration.py
 ```
+
+若系统默认 `python` 不是 Python 3.14.7，可把上面所有 `python` 替换为
+`.venv/bin/python`；测试与演示均不访问网络、账号、数据库、Docker 或硬件。
 
 ## 仓库结构
 
@@ -35,7 +50,9 @@ tests/
   test_validation.py   输入校验 / 错误语义 / 批量原子性测试
   test_reference.py    与独立参考模型逐完成操作对照
   test_explore.py      枚举、预算耗尽 vs 无解 测试
+  test_sector_model.py 四扇区并发、跨区原子读、乱序确认与独立账本测试
 demo.py          固定输入演示（失效链 + 重排枚举 + 异常边界）
+demo_iteration.py 四扇区增量演示（独立写、跨区读、迟到 ACK、合成枚举）
 ```
 
 ## 规模与输入上限（接口边界）
@@ -44,6 +61,8 @@ demo.py          固定输入演示（失效链 + 重排枚举 + 异常边界）
 |---|---|
 | 核数 `NUM_CORES` | 固定 3（核编号 0,1,2） |
 | 地址数 `NUM_ADDRS` | 固定 8（地址编号 0..7） |
+| 扇区数 `NUM_SECTORS` | 固定 4（仅四扇区模式） |
+| 扇区掩码 | 整数 `1..15`，bit i 表示扇区 i；四扇区模式缺省为全行 `15` |
 | 目录节点编号 `DIR` | 3（仅用于消息的 src/dst） |
 | 数据值 | 任意 Python `int`（任意精度，无溢出语义） |
 | 事务 id / 消息 id | 正整数；不显式给事务 id 时内核自动分配 |
@@ -73,9 +92,42 @@ print(k.completed()[-1].value)                 # 200
 
 ## 公开接口
 
+### 四扇区缓存行模式
+
+```python
+from msi_kernel import CacheCoherenceKernel, LineMode, Op
+
+k = CacheCoherenceKernel(memory={0: 0}, mode=LineMode.FOUR_SECTOR)
+for core in range(3):
+    k.request(core, 0, Op.LOAD, sectors=0b1111)   # 三核共享整行
+k.request(0, 0, Op.STORE, value=(10,), sectors=0b0001)
+k.request(1, 0, Op.STORE, value=(20,), sectors=0b0010)  # 不重叠，并行推进
+k.request(2, 0, Op.LOAD, sectors=0b0011)                # 跨扇区原子读
+```
+
+契约要点：
+
+- `Request.sectors` 是扇区掩码；四扇区模式缺省为 `0b1111`，整行模式显式
+  传 `sectors` 会被拒绝。
+- 扇区模式 store 的 `value` 按掩码覆盖顺序给元组，例如 `sectors=0b0101`
+  时 `(v0, v2)`；load/store 的 `Completion.value` 也是同顺序元组。
+- 每个扇区独立维护目录状态、共享者集合、dirty owner、目录内存值和单调
+  数据版本；快照通过 `sector_caches`、`sector_directory`、`sector_txns`
+  暴露。
+- 不重叠扇区的事务可并存；任一活动或先排队事务与新请求掩码相交时，新
+  请求进入该地址 FIFO 队列。完成一个事务后只按队首继续泵送，因此重叠
+  请求仍严格串行。
+- 网络消息携带同一事务 id 与扇区掩码。`INV_ACK` 只消除该事务、该核、
+  对应扇区的等待；`FLUSH` 携带 `(value, version)` 和单扇区掩码。错误
+  扇区、重复等待项或已结束事务的迟到确认都返回 `stale`，不能放行任何
+  新事务。
+- 跨多个扇区的 load 是一个事务：必须等所有缺失扇区的回写完成，在同一
+  授数时刻安装全部扇区并一次性完成，不能返回半个旧值、半个未授权新值。
+
 ### 请求输入
 
 - `kernel.request(core, addr, op, *, value=None, txn_id=None) -> RequestReport`
+- 四扇区模式可追加 `sectors=mask`；缺省为全行掩码。
 - `kernel.request_batch(iterable_of_Request) -> list[RequestReport]`
   **原子**：整批先校验（含批内事务 id 去重），任一非法则内核零变更。
 - 同地址请求 FIFO 排队（`RequestReport.queued=True`）；不同地址事务独立，
@@ -112,6 +164,7 @@ print(k.completed()[-1].value)                 # 200
 
 `FETCH`（目录→M owner，要求回写并降级）、`FLUSH`（owner→目录，带数据）、
 `INV`（目录→共享者，要求失效）、`INV_ACK`（共享者→目录）。
+四扇区模式下消息额外携带 `sectors`；`FLUSH.value` 为 `(value, version)`。
 
 ### 枚举与搜索（`msi_kernel.explore`）
 
@@ -137,6 +190,9 @@ print(k.completed()[-1].value)                 # 200
 4. 目录 S：无 M 缓存、owner 为空，每个持 S 的核都登记在共享者集合中
    （INV 已在核端生效、ACK 在途时，目录共享者集合可暂时多出核）；
 5. 目录 I：全部缓存为 I，owner 为空。
+
+四扇区模式将 1–5 逐扇区检查，并额外检查同一地址任意两个活动事务的扇区
+掩码不得重叠；这就是测试使用的逐扇区单写者不变量。
 
 ## 错误语义
 
@@ -167,6 +223,11 @@ store 的写入值（此前无 store 则为初始内存值）。测试再用内�
 全部消息重排上复核。内核快照的自洽检查只作为补充断言，不用核心给自己算
 期望值。
 
+四扇区新增 `tests/test_sector_model.py` 中的独立串行账本：按完成顺序记录
+每个扇区最后一次已提交写入，load 完成值必须逐扇区等于账本。合成 DFS
+在每个消息前缀调用 `check_invariants`，再对每条终态路径核对账本；参考
+不调用内核来产生期望值。
+
 ## 设计取舍
 
 - **固定 3 核 8 地址**：规模是题面契约的一部分，不做任意规模泛化。
@@ -187,6 +248,8 @@ store 的写入值（此前无 store 则为初始内存值）。测试再用内�
 - 只实现题面契约的 **MSI 有限子集**：无 MESI/MOESI、无缓存间直传、无替换
   写回（容量无限）、无分支/合并事务、无消息超时与重传协议。**不宣称兼容
   任何工业标准处理器的一致性实现。**
+- 四扇区模式是固定 4 扇区的离散模型：没有字节级掩码、部分写合并、真实
+  缓存行布局、硬件竞争窗口或性能计数；数据版本仅用于模型内回写校验。
 - 显式注入的报文（陈旧/乱序输入）不参与 `explore` 的常规重排枚举，常规
   枚举只投递内核实际产生的报文；异常网络路径由定向单元测试覆盖。
 - 穷举复杂度随并发消息数阶乘增长，`budget` 是硬保护；触发预算时结果中
