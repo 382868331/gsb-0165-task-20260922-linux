@@ -1,8 +1,10 @@
-# msi_kernel — 消息驱动的 MSI 目录一致性内核（3 核 / 8 地址）
+# msi_kernel — 消息驱动的 MSI 目录一致性内核（3 核 / 8 地址，含 CAS）
 
 一个**纯离线、纯离散事件**的目录式缓存一致性消息内核可复用模块。不含真实
 线程、不含真实网络：load/store 请求与网络报文投递全部是显式函数调用，
 调用方决定报文投递顺序，因此同一份核心可以被确定性地驱动、重放与穷举。
+本版本在原有 load/store 之上新增 **CAS（compare-and-swap）** 请求与
+**请求级幂等重放**。
 
 ## 运行环境
 
@@ -11,13 +13,24 @@
   中间件 / 云 API / Docker。
 - Linux 原生运行。
 
+## venv 准备
+
+```bash
+# 仓库根目录；.venv 仅是隔离运行环境，不安装任何第三方包
+python3.14 -m venv .venv
+source .venv/bin/activate        # 或直接使用 .venv/bin/python
+```
+
 ## 准确命令
 
 ```bash
 # 必要测试（在仓库根目录执行）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.1 秒内完成，上限约定为约 8 秒）
+# CAS 增量演示（固定输入、现场计算，约 0.1 秒完成，上限约定 90 秒）
+python demo_iteration.py
+
+# 原有 load/store 演示仍然可用
 python demo.py
 ```
 
@@ -35,7 +48,9 @@ tests/
   test_validation.py   输入校验 / 错误语义 / 批量原子性测试
   test_reference.py    与独立参考模型逐完成操作对照
   test_explore.py      枚举、预算耗尽 vs 无解 测试
-demo.py          固定输入演示（失效链 + 重排枚举 + 异常边界）
+  test_cas.py          CAS 行为 / 幂等重放 / 延迟 ACK / 参数校验测试
+demo.py            固定输入演示（失效链 + 重排枚举 + 异常边界）
+demo_iteration.py  CAS 增量演示（并发 CAS / 夹在写之间 / 重传 / 异常边界）
 ```
 
 ## 规模与输入上限（接口边界）
@@ -75,7 +90,17 @@ print(k.completed()[-1].value)                 # 200
 
 ### 请求输入
 
-- `kernel.request(core, addr, op, *, value=None, txn_id=None) -> RequestReport`
+- `kernel.request(core, addr, op, *, value=None, expected=None, new_value=None, txn_id=None) -> RequestReport`
+- **CAS**：`op=Op.CAS`，携带 `expected`（期望值）与 `new_value`（新值），
+  均为 int；`value` 必须为 None。完成事件 `Completion.value` 为**交换前
+  旧值**，`success` 为是否交换成功，`expected/new_value` 原样记录。
+  比较只在目录授予该核独占权（M）、必要失效（INV_ACK 齐）与回写
+  （FLUSH）全部完成后进行；**绝不在发请求时读旧缓存值作决定**。
+  被延迟的失效确认不会提前发布 CAS 完成：ACK 未齐没有任何完成事件。
+- **幂等重放**：以相同 `txn_id` 重传**参数完全一致**的请求，返回原结果
+  （已完成：原完成事件；在途：`queued=True`），不会再次交换；
+  `txn_id` 相同而参数不同（含换 op）抛 `InvalidRequestError`。
+- CAS 与同地址普通读写在同一 FIFO 队列中按目录授予顺序线性化。
 - `kernel.request_batch(iterable_of_Request) -> list[RequestReport]`
   **原子**：整批先校验（含批内事务 id 去重），任一非法则内核零变更。
 - 同地址请求 FIFO 排队（`RequestReport.queued=True`）；不同地址事务独立，
@@ -146,8 +171,9 @@ print(k.completed()[-1].value)                 # 200
   （`True/False` 不会被当作 1/0）。
 - 数值输入拒绝 `NaN` / 正负 `Infinity`，普通 `float` 也拒绝（消息明确要求
   整数数据）；报错信息区分 NaN、Infinity、普通 float。
-- load 不得带 value；store 必须带 int value；事务 id 必须为正整数且全生命
-  周期唯一。
+- load 不得带 value；store 必须带 int value；cas 必须带 int expected 与
+  int new_value 且不得带 value；事务 id 必须为正整数。txn_id 的全生命周期
+  唯一性按"幂等重放"口径执行：同 id 同参数为重放，同 id 不同参数拒绝。
 - 失败不留未说明的部分变更：批量请求先整体校验后生效；报文处理的有效性判定
   先于任何状态修改。
 
@@ -187,6 +213,10 @@ store 的写入值（此前无 store 则为初始内存值）。测试再用内�
 - 只实现题面契约的 **MSI 有限子集**：无 MESI/MOESI、无缓存间直传、无替换
   写回（容量无限）、无分支/合并事务、无消息超时与重传协议。**不宣称兼容
   任何工业标准处理器的一致性实现。**
+- CAS 复用 store 的独占获取路径（FETCH/FLUSH/INV/INV_ACK），没有新增消息
+  类型；不提供 LL/SC、多字 CAS 或失败重试策略。
+- 幂等重放登记（txn_id → 请求/完成事件）在内核生命周期内常驻内存，不提供
+  过期清理；重放判定要求请求参数逐项完全一致。
 - 显式注入的报文（陈旧/乱序输入）不参与 `explore` 的常规重排枚举，常规
   枚举只投递内核实际产生的报文；异常网络路径由定向单元测试覆盖。
 - 穷举复杂度随并发消息数阶乘增长，`budget` 是硬保护；触发预算时结果中

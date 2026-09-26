@@ -80,7 +80,8 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
         for m in snap.pending_messages
     ))
     queues = tuple(
-        tuple((q.txn_id, q.core, q.op.value, q.value) for q in qq)
+        tuple((q.txn_id, q.core, q.op.value, q.value, q.expected, q.new_value)
+              for q in qq)
         for qq in snap.queues
     )
     completed = tuple(

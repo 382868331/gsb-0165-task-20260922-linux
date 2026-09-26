@@ -10,6 +10,8 @@
 
 协议子集（固定规模 NUM_CORES=3, NUM_ADDRS=8）：
 - 每核每地址缓存行为 I / S / M；
+- 请求为 load / store / cas；cas 在取得独占权并完成必要失效后才比较，
+  返回交换前旧值与成功标志；同 txn_id 同参数重传为幂等重放；
 - 目录每地址记录状态、共享者集合、M 的 owner、内存值、活动事务与 FIFO 等待队列；
 - 升级（S→M，或写他核 M）必须等齐全部失效 ACK 才提交；
 - 读处于 M 的地址：目录先 FETCH 令 owner 回写（FLUSH），再以 S 共享；
@@ -45,6 +47,7 @@ class Op(str, Enum):
 
     LOAD = "load"
     STORE = "store"
+    CAS = "cas"
 
 
 class MsgType(str, Enum):
@@ -81,13 +84,20 @@ class Request:
 
     LOAD 的 value 必须为 None；STORE 必须给 int 类型 value（bool 拒绝，
     float 拒绝，NaN/Infinity 给出明确报错）。
+    CAS 必须给 int 类型 expected（期望值）与 new_value（新值），value
+    必须为 None；比较发生在内核取得该行独占权并完成必要失效之后，
+    不在发请求时读旧缓存值作决定。
     txn_id 为 None 时内核自动分配；显式给出时必须为正整数且全生命周期唯一。
+    以相同 txn_id 重传参数完全一致的请求是幂等重放：返回原结果，不会
+    再次执行；txn_id 相同而参数不同一律拒绝。
     """
 
     core: int
     addr: int
     op: Op
     value: Optional[int] = None
+    expected: Optional[int] = None
+    new_value: Optional[int] = None
     txn_id: Optional[int] = None
 
 
@@ -113,6 +123,9 @@ class Completion:
     """一个事务的完成事件。
 
     LOAD 的 value 为实际完成读值；STORE 的 value 为写入值。
+    CAS 的 value 为交换前的旧值，expected 为请求携带的期望值，
+    success 为是否成功交换，new_value 为请求携带的新值（仅当
+    success 时写入）。
     """
 
     txn_id: int
@@ -120,6 +133,9 @@ class Completion:
     addr: int
     op: Op
     value: int
+    success: Optional[bool] = None
+    expected: Optional[int] = None
+    new_value: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +161,8 @@ class QueuedRequestView:
     addr: int
     op: Op
     value: Optional[int]
+    expected: Optional[int] = None
+    new_value: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +221,8 @@ class _Txn:
     core: int
     op: Op
     value: Optional[int]
+    expected: Optional[int]
+    new_value: Optional[int]
     awaiting_flush: bool          # 正在等 owner 的 FLUSH
     awaiting_acks: set[int]       # 尚待 INV_ACK 的核集合
     flush_owner: Optional[int]    # FLUSH 阶段前的 owner
@@ -278,12 +298,36 @@ def _validate_request(req: object, *, request_seq: Optional[int]) -> Request:
             raise InvalidRequestError(
                 "load 请求不能带 value（完成读值由 Completion 给出）",
                 request_seq=request_seq, field="value")
-    else:
+        if req.expected is not None or req.new_value is not None:
+            raise InvalidRequestError(
+                "load 请求不能带 expected/new_value",
+                request_seq=request_seq, field="expected")
+    elif req.op is Op.STORE:
         if req.value is None:
             raise InvalidRequestError(
                 "store 请求必须提供 int 类型 value",
                 request_seq=request_seq, field="value")
         _check_int("value", req.value, request_seq=request_seq)
+        if req.expected is not None or req.new_value is not None:
+            raise InvalidRequestError(
+                "store 请求不能带 expected/new_value",
+                request_seq=request_seq, field="expected")
+    else:
+        # CAS：期望值与新值都必须是 int；比较推迟到取得独占权之后。
+        if req.value is not None:
+            raise InvalidRequestError(
+                "cas 请求不能带 value（请用 expected/new_value）",
+                request_seq=request_seq, field="value")
+        if req.expected is None:
+            raise InvalidRequestError(
+                "cas 请求必须提供 int 类型 expected（期望值）",
+                request_seq=request_seq, field="expected")
+        if req.new_value is None:
+            raise InvalidRequestError(
+                "cas 请求必须提供 int 类型 new_value（新值）",
+                request_seq=request_seq, field="new_value")
+        _check_int("expected", req.expected, request_seq=request_seq)
+        _check_int("new_value", req.new_value, request_seq=request_seq)
     if req.txn_id is not None:
         _check_int("txn_id", req.txn_id, request_seq=request_seq)
         if req.txn_id <= 0:
@@ -325,6 +369,9 @@ class CacheCoherenceKernel:
         self._history: dict[int, Message] = {}
         self._completed: list[Completion] = []
         self._used_txn: set[int] = set()
+        # 幂等重放登记：txn_id -> 原始请求 / 原完成事件。
+        self._req_log: dict[int, Request] = {}
+        self._done_by_txn: dict[int, Completion] = {}
         self._next_txn = 1
         self._next_msg = 1
 
@@ -364,7 +411,8 @@ class CacheCoherenceKernel:
         )
         queues = tuple(
             tuple(
-                QueuedRequestView(r.txn_id, r.core, r.addr, r.op, r.value)
+                QueuedRequestView(r.txn_id, r.core, r.addr, r.op, r.value,
+                                  r.expected, r.new_value)
                 for r in e.queue
             )
             for e in self._dir
@@ -382,14 +430,20 @@ class CacheCoherenceKernel:
 
     def request(self, core: int, addr: int, op: Op, *,
                 value: Optional[int] = None,
+                expected: Optional[int] = None,
+                new_value: Optional[int] = None,
                 txn_id: Optional[int] = None) -> RequestReport:
-        """输入一条 load/store 请求。
+        """输入一条 load/store/cas 请求。
 
         该地址有活动事务或已有排队请求时进入 FIFO 队列（queued=True）；
         无消息即可满足的请求（I/S 命中、I 上写、独占 S 升级）在本次调用内完成。
+        以相同 txn_id 重传参数完全一致的请求为幂等重放：已完成则返回原
+        完成事件，仍在途则报告 queued，不会再次执行；txn_id 相同而参数
+        不同抛 InvalidRequestError。
         """
         req = _validate_request(
-            Request(core, addr, op, value, txn_id), request_seq=0)
+            Request(core, addr, op, value, expected, new_value, txn_id),
+            request_seq=0)
         return self._admit(req)
 
     def request_batch(self, requests: Iterable[Request]) -> list[RequestReport]:
@@ -411,10 +465,17 @@ class CacheCoherenceKernel:
         for seq, raw in enumerate(original):
             req = _validate_request(raw, request_seq=seq)
             if req.txn_id is not None:
-                if req.txn_id in seen_ids or req.txn_id in self._used_txn:
+                if req.txn_id in seen_ids:
                     raise InvalidRequestError(
-                        f"txn_id={req.txn_id} 重复（批内或历史中已存在）",
+                        f"txn_id={req.txn_id} 在批内重复",
                         request_seq=seq, field="txn_id")
+                if req.txn_id in self._used_txn:
+                    prev = self._req_log.get(req.txn_id)
+                    if prev != req:
+                        raise InvalidRequestError(
+                            f"txn_id={req.txn_id} 已被不同参数的请求使用",
+                            request_seq=seq, field="txn_id")
+                    # 参数完全一致：幂等重放，由 _admit 返回原结果。
                 seen_ids.add(req.txn_id)
             validated.append(req)
         reports: list[RequestReport] = []
@@ -435,14 +496,23 @@ class CacheCoherenceKernel:
     def _admit(self, req: Request) -> RequestReport:
         if req.txn_id is None:
             req = Request(req.core, req.addr, req.op, req.value,
-                          self._alloc_txn())
+                          req.expected, req.new_value, self._alloc_txn())
         elif req.txn_id in self._used_txn:
-            raise InvalidRequestError(
-                f"txn_id={req.txn_id} 已被使用", field="txn_id")
+            prev = self._req_log[req.txn_id]
+            if prev != req:
+                raise InvalidRequestError(
+                    f"txn_id={req.txn_id} 已被不同参数的请求使用"
+                    f"（原请求 {prev}）", field="txn_id")
+            # 幂等重放：参数完全一致的重传不再次执行。
+            done = self._done_by_txn.get(req.txn_id)
+            if done is not None:
+                return RequestReport(req.txn_id, False, (done,))
+            return RequestReport(req.txn_id, True, ())
         else:
             self._used_txn.add(req.txn_id)
             if req.txn_id >= self._next_txn:
                 self._next_txn = req.txn_id + 1
+        self._req_log[req.txn_id] = req
         entry = self._dir[req.addr]
         if entry.txn is not None or entry.queue:
             entry.queue.append(req)
@@ -476,11 +546,14 @@ class CacheCoherenceKernel:
             # 目录 M 且 owner 为别的核：先回写再共享。
             owner = entry.owner
             assert owner is not None
-            entry.txn = _Txn(req.txn_id, core, Op.LOAD, None,
+            entry.txn = _Txn(req.txn_id, core, Op.LOAD, None, None, None,
                              awaiting_flush=True, awaiting_acks=set(),
                              flush_owner=owner)
             self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
             return done
+
+        if req.op is Op.CAS:
+            return self._start_cas(req, entry, done)
 
         # STORE
         if entry.state is State.MODIFIED and entry.owner == core:
@@ -506,7 +579,7 @@ class CacheCoherenceKernel:
                 entry.sharers.clear()
                 self._finish(req, req.value, done)
                 return done
-            entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value,
+            entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value, None, None,
                              awaiting_flush=False, awaiting_acks=set(targets),
                              flush_owner=None)
             for c in sorted(targets):
@@ -515,17 +588,97 @@ class CacheCoherenceKernel:
         # 目录 M、owner 为别的核：先回写，再失效旧 owner，最后升级。
         owner = entry.owner
         assert owner is not None
-        entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value,
+        entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value, None, None,
                          awaiting_flush=True, awaiting_acks=set(),
                          flush_owner=owner)
         self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
         return done
 
+    # -- CAS ----------------------------------------------------------------
+
+    def _start_cas(self, req: Request, entry: _DirEntry,
+                   done: list[Completion]) -> list[Completion]:
+        """CAS 准入：先按 store 相同的路径取得独占权，比较只在取得后进行。
+
+        绝不在准入时读旧缓存值作决定：需要失效/回写时先挂事务，
+        等齐 ACK / FLUSH 后在 _finalize_cas 中比较并提交。
+        """
+        core, addr = req.core, req.addr
+        line = self._caches[core][addr]
+        if entry.state is State.MODIFIED and entry.owner == core:
+            self._commit_cas(req, line.value, done)
+            return done
+        if entry.state is State.INVALID:
+            line.state = State.MODIFIED
+            line.value = self._memory[addr]
+            entry.state = State.MODIFIED
+            entry.owner = core
+            self._commit_cas(req, self._memory[addr], done)
+            return done
+        if entry.state is State.SHARED:
+            targets = set(entry.sharers)
+            targets.discard(core)
+            if not targets:
+                line.state = State.MODIFIED
+                entry.state = State.MODIFIED
+                entry.owner = core
+                entry.sharers.clear()
+                self._commit_cas(req, line.value, done)
+                return done
+            entry.txn = _Txn(req.txn_id, core, Op.CAS, None,
+                             req.expected, req.new_value,
+                             awaiting_flush=False,
+                             awaiting_acks=set(targets), flush_owner=None)
+            for c in sorted(targets):
+                self._send(MsgType.INV, DIR, c, addr, req.txn_id)
+            return done
+        # 目录 M、owner 为别的核：先 FETCH 回写，再失效旧 owner，最后比较。
+        owner = entry.owner
+        assert owner is not None
+        entry.txn = _Txn(req.txn_id, core, Op.CAS, None,
+                         req.expected, req.new_value,
+                         awaiting_flush=True, awaiting_acks=set(),
+                         flush_owner=owner)
+        self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
+        return done
+
+    def _commit_cas(self, req: Request, old: int,
+                    done: list[Completion]) -> None:
+        """在独占权已持有、必要失效已完成的前提下比较并（可能）交换。"""
+        line = self._caches[req.core][req.addr]
+        success = old == req.expected
+        line.value = req.new_value if success else old
+        self._finish(req, old, done, success=success,
+                     new_value=req.new_value)
+
+    def _finalize_cas(self, addr: int, txn: _Txn,
+                      done: list[Completion]) -> None:
+        """异步 CAS 提交：等齐全部 INV_ACK / FLUSH 后才会走到这里。"""
+        entry = self._dir[addr]
+        line = self._caches[txn.core][addr]
+        # 异步路径上目录内存必然是最新值（S：内存干净；M：FLUSH 已回写）。
+        old = self._memory[addr]
+        success = old == txn.expected
+        line.state = State.MODIFIED
+        line.value = txn.new_value if success else old
+        entry.state = State.MODIFIED
+        entry.owner = txn.core
+        entry.sharers.clear()
+        entry.txn = None
+        self._finish(
+            Request(txn.core, addr, Op.CAS, None, txn.expected,
+                    txn.new_value, txn.txn_id),
+            old, done, success=success, new_value=txn.new_value)
+
     def _finish(self, req: Request, value: Optional[int],
-                done: list[Completion]) -> None:
+                done: list[Completion], *,
+                success: Optional[bool] = None,
+                new_value: Optional[int] = None) -> None:
         assert value is not None
-        comp = Completion(req.txn_id, req.core, req.addr, req.op, value)
+        comp = Completion(req.txn_id, req.core, req.addr, req.op, value,
+                          success, req.expected, new_value)
         self._completed.append(comp)
+        self._done_by_txn[req.txn_id] = comp
         done.append(comp)
         self._pump_queue(req.addr, done)
 
@@ -698,16 +851,16 @@ class CacheCoherenceKernel:
                 line.state = State.SHARED
                 line.value = msg.value
                 entry.sharers.add(txn.core)
-                self._finish(Request(txn.core, msg.addr, Op.LOAD, None,
-                                     txn.txn_id), msg.value, done)
+                self._finish(Request(txn.core, msg.addr, Op.LOAD,
+                                     txn_id=txn.txn_id), msg.value, done)
                 return None
-            # STORE：回写完成后失效旧 owner（若 requester 就是旧 owner，
+            # STORE/CAS：回写完成后失效旧 owner（若 requester 就是旧 owner，
             # 该路径在准入时已被 M 命中覆盖，故 targets 必含旧 owner）。
             targets = {old_owner}
             targets.discard(txn.core)
             txn.awaiting_acks = targets
             if not targets:
-                self._finalize_store(msg.addr, txn, done)
+                self._finalize_write(msg.addr, txn, done)
             else:
                 for c in sorted(targets):
                     self._send(MsgType.INV, DIR, c, msg.addr, txn.txn_id)
@@ -722,8 +875,15 @@ class CacheCoherenceKernel:
         txn.awaiting_acks.discard(msg.src)
         entry.sharers.discard(msg.src)
         if not txn.awaiting_acks:
-            self._finalize_store(msg.addr, txn, done)
+            self._finalize_write(msg.addr, txn, done)
         return None
+
+    def _finalize_write(self, addr: int, txn: _Txn,
+                        done: list[Completion]) -> None:
+        if txn.op is Op.CAS:
+            self._finalize_cas(addr, txn, done)
+        else:
+            self._finalize_store(addr, txn, done)
 
     def _finalize_store(self, addr: int, txn: _Txn,
                         done: list[Completion]) -> None:
@@ -735,5 +895,5 @@ class CacheCoherenceKernel:
         entry.owner = txn.core
         entry.sharers.clear()
         entry.txn = None
-        self._finish(Request(txn.core, addr, Op.STORE, txn.value, txn.txn_id),
-                     txn.value, done)
+        self._finish(Request(txn.core, addr, Op.STORE, txn.value,
+                             txn_id=txn.txn_id), txn.value, done)
