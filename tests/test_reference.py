@@ -49,7 +49,35 @@ def expected_values_by_txn(scenario, init_memory=None, num_addrs=8):
 
 
 def flat(completions):
-    return [(c.addr, c.op.value, c.value) for c in completions]
+    events = []
+    for c in completions:
+        if c.op is Op.CAS:
+            events.append((c.addr, "cas", c.value, c.success,
+                           c.expected_value, c.new_value))
+        else:
+            events.append((c.addr, c.op.value, c.value))
+    return events
+
+
+def expected_results_by_txn(scenario, init_memory=None, num_addrs=8):
+    mem = [0] * num_addrs
+    if init_memory:
+        for addr, value in init_memory.items():
+            mem[addr] = value
+    allowed = {}
+    for idx, req in enumerate(scenario):
+        tid = req.txn_id if req.txn_id is not None else idx + 1
+        if req.op is Op.LOAD:
+            allowed[tid] = mem[req.addr]
+        elif req.op is Op.STORE:
+            mem[req.addr] = req.value
+        else:
+            old_value = mem[req.addr]
+            success = old_value == req.expected_value
+            allowed[tid] = (old_value, success)
+            if success:
+                mem[req.addr] = req.new_value
+    return allowed
 
 
 # 确定性 LCG 场景生成（不使用随机语料/外部数据）。
@@ -65,12 +93,18 @@ def make_scenario(rng, length, addr_span=8):
     for _ in range(length):
         core = next(rng) % 3
         addr = next(rng) % addr_span
-        is_store = (next(rng) % 2) == 0
-        if is_store:
+        kind = next(rng) % 3
+        if kind == 0:
             value = 1000 + (next(rng) % 100)
             reqs.append(Request(core, addr, Op.STORE, value=value))
-        else:
+        elif kind == 1:
             reqs.append(Request(core, addr, Op.LOAD))
+        else:
+            current = 0
+            expected = current if next(rng) % 2 == 0 else 999
+            reqs.append(Request(core, addr, Op.CAS,
+                                expected_value=expected,
+                                new_value=2000 + (next(rng) % 100)))
     return reqs
 
 
@@ -105,7 +139,7 @@ class TestAgainstIndependentReference(unittest.TestCase):
         for case in range(120):
             init = make_memory(rng)
             scenario = make_scenario(rng, 10)
-            allowed = expected_values_by_txn(scenario, init)
+            allowed = expected_results_by_txn(scenario, init)
             k = CacheCoherenceKernel(memory=dict(init))
             k.request_batch(scenario)
             drain(k)
@@ -116,8 +150,13 @@ class TestAgainstIndependentReference(unittest.TestCase):
                 by_txn[c.txn_id] = c
             for tid, want in allowed.items():
                 self.assertIn(tid, by_txn, f"case {case}: txn {tid} 未完成")
-                self.assertEqual(by_txn[tid].value, want,
-                                 f"case {case} txn {tid}")
+                comp = by_txn[tid]
+                if comp.op is Op.CAS:
+                    self.assertEqual((comp.value, comp.success), want,
+                                     f"case {case} txn {tid}")
+                else:
+                    self.assertEqual(comp.value, want,
+                                     f"case {case} txn {tid}")
             check_completion_sequence(flat(k.completed()), init)
 
     def test_deterministic_generated_shuffled_deliveries(self):
@@ -126,7 +165,7 @@ class TestAgainstIndependentReference(unittest.TestCase):
         for case in range(40):
             init = make_memory(rng)
             scenario = make_scenario(rng, 8)
-            allowed = expected_values_by_txn(scenario, init)
+            allowed = expected_results_by_txn(scenario, init)
             k = CacheCoherenceKernel(memory=dict(init))
             k.request_batch(scenario)
             while True:
@@ -137,8 +176,13 @@ class TestAgainstIndependentReference(unittest.TestCase):
                 k.deliver(choice.msg_id)
             by_txn = {c.txn_id: c for c in k.completed()}
             for tid, want in allowed.items():
-                self.assertEqual(by_txn[tid].value, want,
-                                 f"case {case} txn {tid}")
+                comp = by_txn[tid]
+                if comp.op is Op.CAS:
+                    self.assertEqual((comp.value, comp.success), want,
+                                     f"case {case} txn {tid}")
+                else:
+                    self.assertEqual(comp.value, want,
+                                     f"case {case} txn {tid}")
             check_completion_sequence(flat(k.completed()), init)
 
     def test_reference_detects_wrong_value(self):
@@ -158,23 +202,25 @@ class TestExhaustiveReferenceComparison(unittest.TestCase):
     def test_all_small_scenarios_all_rearrangements(self):
         # 穷举所有“3 核、2 地址、4 个操作”的小规模场景，枚举全部消息重排，
         # 每个调度都过不变量检查与独立参考允许值检查。
-        ops = []
-        for core in range(3):
-            for addr in range(2):
-                ops.append((core, addr, Op.LOAD))
-                ops.append((core, addr, Op.STORE, 10 + core))
-        # 全组合 12^4=20736 太多；用 LCG 固定抽取 300 个场景。
+        # 从 load/store/CAS 中用 LCG 固定抽取 300 个小场景。
         rng = _lcg(99)
         for case in range(300):
             scenario = []
             for _ in range(4):
-                core, addr, op = ops[next(rng) % len(ops)][:3]
-                if op is Op.STORE:
-                    scenario.append(Request(core, addr, op,
+                core = next(rng) % 3
+                addr = next(rng) % 2
+                kind = next(rng) % 3
+                if kind == 0:
+                    scenario.append(Request(core, addr, Op.STORE,
                                             value=10 + (next(rng) % 7)))
+                elif kind == 1:
+                    scenario.append(Request(core, addr, Op.LOAD))
                 else:
-                    scenario.append(Request(core, addr, op))
-            allowed = expected_values_by_txn(scenario, {})
+                    expected = 0 if next(rng) % 2 == 0 else 999
+                    scenario.append(Request(core, addr, Op.CAS,
+                                            expected_value=expected,
+                                            new_value=30 + (next(rng) % 7)))
+            allowed = expected_results_by_txn(scenario, {})
             res = explore(lambda: CacheCoherenceKernel(), scenario,
                           budget=200_000)
             self.assertFalse(res.exhausted, f"case {case} 预算耗尽")
@@ -182,7 +228,10 @@ class TestExhaustiveReferenceComparison(unittest.TestCase):
             for path, completions in res.schedules.items():
                 by_txn = {c.txn_id: c for c in completions}
                 for tid, want in allowed.items():
-                    self.assertEqual(by_txn[tid].value, want,
+                    comp = by_txn[tid]
+                    actual = ((comp.value, comp.success) if comp.op is Op.CAS
+                              else comp.value)
+                    self.assertEqual(actual, want,
                                      f"case {case} path {path} txn {tid}")
                 check_completion_sequence(flat(completions), {})
                 # 终态：每个地址至多一个 M，M 时无 S。

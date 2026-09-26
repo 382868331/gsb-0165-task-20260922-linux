@@ -14,11 +14,18 @@
 ## 准确命令
 
 ```bash
+# 可选：用 Python 3.14.7 创建并启用本地 venv（无需第三方依赖）
+python3.14 -m venv .venv
+source .venv/bin/activate
+
 # 必要测试（在仓库根目录执行）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（约 0.1 秒内完成，上限约定为约 8 秒）
+# 原消息模型固定输入演示
 python demo.py
+
+# 本题新增 CAS 固定输入演示（现场离散计算，无等待；上限 90 秒）
+python demo_iteration.py
 ```
 
 ## 仓库结构
@@ -30,12 +37,14 @@ msi_kernel/
   model.py       协议内核：状态、请求准入、消息处理、排队与完成
   explore.py     消息重排枚举、不变量检查、有界搜索
 tests/
-  reference.py   独立参考模型（不导入、不调用被测核心来产生期望值）
-  test_model.py        协议行为测试
-  test_validation.py   输入校验 / 错误语义 / 批量原子性测试
-  test_reference.py    与独立参考模型逐完成操作对照
-  test_explore.py      枚举、预算耗尽 vs 无解 测试
-demo.py          固定输入演示（失效链 + 重排枚举 + 异常边界）
+  reference.py       独立标量参考模型（不导入、不调用被测核心来产生期望值）
+  test_model.py      load/store 协议行为测试
+  test_cas.py        CAS 独占后比较、FIFO、重放和异常路径测试
+  test_validation.py 输入校验 / 错误语义 / 批量原子性测试
+  test_reference.py  与独立标量参考逐完成操作对照
+  test_explore.py    枚举、预算耗尽 vs 无解 测试
+demo.py              原消息模型固定输入演示
+demo_iteration.py    新增 CAS 固定输入演示
 ```
 
 ## 规模与输入上限（接口边界）
@@ -69,6 +78,18 @@ print(k.completed()[-1])                       # store 完成事件，值 200
 k.request(2, 0, Op.LOAD)                       # 读 M：先 FETCH owner 回写
 drain(k)                                       # 按 id 升序排空待发消息
 print(k.completed()[-1].value)                 # 200
+
+k = CacheCoherenceKernel(memory={0: 0})
+k.request_batch([
+    Request(0, 0, Op.LOAD),
+    Request(1, 0, Op.LOAD),
+    Request(1, 0, Op.CAS, expected_value=0, new_value=10, txn_id=101),
+    Request(0, 0, Op.CAS, expected_value=0, new_value=20, txn_id=102),
+])
+drain(k)
+# CAS101: Completion(value=0, success=True, expected_value=0, new_value=10)
+# CAS102 按 FIFO 在其后执行：Completion(value=10, success=False, ...)
+# 再次提交同一个 Request(..., txn_id=101) 只返回原结果，不会第二次交换
 ```
 
 ## 公开接口
@@ -76,10 +97,21 @@ print(k.completed()[-1].value)                 # 200
 ### 请求输入
 
 - `kernel.request(core, addr, op, *, value=None, txn_id=None) -> RequestReport`
+- CAS 使用 `Op.CAS`：`kernel.request(core, addr, Op.CAS, expected_value=old,
+  new_value=new, txn_id=request_id)`；完成事件的 `value` 是交换前旧值，
+  `success=True` 表示旧值等于期望值并写入新值，`success=False` 表示不改值。
+- CAS 必须显式给整数 `expected_value`、`new_value`；需要重传时还应给稳定
+  `txn_id`。`bool`、`float`、`NaN`/`Infinity` 均拒绝。
 - `kernel.request_batch(iterable_of_Request) -> list[RequestReport]`
   **原子**：整批先校验（含批内事务 id 去重），任一非法则内核零变更。
 - 同地址请求 FIFO 排队（`RequestReport.queued=True`）；不同地址事务独立，
   可并存、可交错。
+- CAS 与同地址普通 `LOAD/STORE` 按目录准入顺序线性化。CAS 发起时不读取
+  请求核旧缓存作判断；目录先取得该行独占权并完成必要 FETCH/INV，待所有
+  需要的回写和失效 ACK 到齐后，才在唯一提交点比较当前旧值。
+- 相同 `txn_id` 的完全相同 CAS 请求是重传：返回原 `RequestReport` 和原
+  `Completion`，不会再次交换；相同 ID 但 core/addr/op/expected/new/value
+  任一参数不同都会拒绝。同一批次内重复 ID 仍按非法批次拒绝。
 - 无需消息即可满足的请求（I/S 命中、I 上写、唯一共享者升级）在调用内同步
   完成，完成事件放在 `RequestReport.completions`。
 
@@ -104,14 +136,16 @@ print(k.completed()[-1].value)                 # 200
 
 - `kernel.snapshot() -> Snapshot`：每核缓存、每地址目录项（状态 / 共享者 /
   owner / 活动事务 / 等待 ACK 集合）、内存、待发消息、每地址 FIFO 队列、
-  完成事件。所有视图为只读拷贝。
+  完成事件，以及 CAS 的 expected/new 参数。所有视图为只读拷贝。
 - `kernel.pending()` / `kernel.completed()`。
 - `Message` / `Request` / `Completion` 等数据结构均为 frozen dataclass。
 
 ### 消息类型（有限协议子集）
 
 `FETCH`（目录→M owner，要求回写并降级）、`FLUSH`（owner→目录，带数据）、
-`INV`（目录→共享者，要求失效）、`INV_ACK`（共享者→目录）。
+`INV`（目录→共享者，要求失效）、`INV_ACK`（共享者→目录）。CAS 不增加
+真实原子指令或特殊网络消息，只复用这些消息模拟独占权获取；最终比较由
+Python 标量状态机完成。
 
 ### 枚举与搜索（`msi_kernel.explore`）
 
@@ -159,13 +193,20 @@ print(k.completed()[-1].value)                 # 200
 
 ## 独立参考模型如何验证
 
-`tests/reference.py` **不导入 `msi_kernel`**，只对完成事件
-`(addr, op, value)` 序列运行一个平凡的“每地址最后写入”抽象机：同地址操作
-严格按准入 FIFO 完成，故某 load 的允许读值唯一等于该地址在它之前最后一次
-store 的写入值（此前无 store 则为初始内存值）。测试再用内核实际跑出的完成
-序列与该允许值逐完成操作对照，并在 300 个随机（确定性 LCG 生成）小场景的
-全部消息重排上复核。内核快照的自洽检查只作为补充断言，不用核心给自己算
-期望值。
+`tests/reference.py` **不导入 `msi_kernel`**，只对完成事件运行一个平凡的
+每地址标量状态机：load 返回当前值；store 写入给定值；CAS 的六元组为
+`(addr, "cas", old_value, success, expected_value, new_value)`，先核对
+`old_value` 是否等于标量当前值以及 `success == (old_value == expected_value)`，
+成功时才推进到 `new_value`。同地址操作严格按准入 FIFO 完成，测试再用内核
+实际跑出的完成序列逐事件对照，并在确定性 LCG 小场景的全部消息重排上复核。
+内核快照的自洽检查只作为补充断言，不用核心给自己算期望值。
+
+新增 CAS 专项验收包括：
+
+- 三个核先共享 0，核1/核2 同时提交 `CAS(0,10)` 与 `CAS(0,20)`，只有一个成功；
+- CAS 夹在两个普通 store 之间，必须看到前一个普通写并受后一个普通写约束；
+- 只收到部分失效 ACK 时不发布 CAS；重复网络 ACK 和重复请求 ID 都不二次交换；
+- 相同 ID 不同参数、CAS 缺参数或错误类型被拒绝。
 
 ## 设计取舍
 
@@ -174,6 +215,9 @@ store 的写入值（此前无 store 则为初始内存值）。测试再用内�
   穷举重排与复现；`drain` 只是提供一个确定性便利驱动。
 - **FETCH 采用“回写后共享”**：owner 收到 FETCH 降级为 S 并回 FLUSH，数据
   写入目录内存后再分发给请求者；不实现缓存间直接传数（没有 Data/DATA 消息）。
+- **CAS 是标量状态机模拟，不调用真实硬件原子指令**：它复用 MSI 的回写和
+  失效流程取得独占权，比较只发生在最后一个必要 ACK/FLUSH 后的提交点；
+  失败的 CAS 也已按本模型取得 M，并保留旧值副本，因此不会回滚缓存状态。
 - **同地址严格串行（FIFO）**，不同地址无锁独立；事务 id 与消息 id 全程唯一，
   幂等以 `msg_id` 身份判定，陈旧性以“报文事务 id 是否等于该地址当前活动
   事务 + 是否在等待集合中”判定。
@@ -187,6 +231,10 @@ store 的写入值（此前无 store 则为初始内存值）。测试再用内�
 - 只实现题面契约的 **MSI 有限子集**：无 MESI/MOESI、无缓存间直传、无替换
   写回（容量无限）、无分支/合并事务、无消息超时与重传协议。**不宣称兼容
   任何工业标准处理器的一致性实现。**
+- CAS 失败后请求核在本模型中持有该行 M（值保持旧值），这是协议取得独占权
+  后的模拟状态，不代表真实 CPU 微架构会选择相同的缓存降级策略。
+- 请求层幂等只按显式 `txn_id` 识别；未显式给 ID 的自动编号 load/store
+  无法表达重传。CAS 验收场景应显式提供稳定请求 ID。
 - 显式注入的报文（陈旧/乱序输入）不参与 `explore` 的常规重排枚举，常规
   枚举只投递内核实际产生的报文；异常网络路径由定向单元测试覆盖。
 - 穷举复杂度随并发消息数阶乘增长，`budget` 是硬保护；触发预算时结果中
