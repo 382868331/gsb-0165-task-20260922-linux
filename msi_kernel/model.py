@@ -28,8 +28,25 @@ from .errors import InvalidMessageError, InvalidRequestError
 
 NUM_CORES = 3
 NUM_ADDRS = 8
+NUM_SECTORS = 4
+ALL_SECTORS = (1 << NUM_SECTORS) - 1
 # 目录在 src/dst 中的编号（核编号为 0..NUM_CORES-1）。
 DIR = NUM_CORES
+
+
+def _iter_sectors(mask: int):
+    for sector in range(NUM_SECTORS):
+        if mask & (1 << sector):
+            yield sector
+
+
+def _check_sector_mask(mask, *, msg: bool = False) -> None:
+    _check_int("sectors", mask, msg=msg)
+    if not 0 < mask <= ALL_SECTORS:
+        err = InvalidMessageError if msg else InvalidRequestError
+        raise err(
+            f"sectors 必须是 1..{ALL_SECTORS} 的非零 4 位掩码，收到 {mask}",
+            field="sectors")
 
 
 class State(str, Enum):
@@ -89,6 +106,7 @@ class Request:
     op: Op
     value: Optional[int] = None
     txn_id: Optional[int] = None
+    sectors: int = ALL_SECTORS
 
 
 @dataclass(frozen=True)
@@ -105,7 +123,8 @@ class Message:
     src: int
     dst: int
     addr: int
-    value: Optional[int] = None
+    value: Optional[object] = None
+    sectors: int = ALL_SECTORS
 
 
 @dataclass(frozen=True)
@@ -120,12 +139,21 @@ class Completion:
     addr: int
     op: Op
     value: int
+    sectors: int = ALL_SECTORS
 
 
 @dataclass(frozen=True)
 class CacheView:
     state: State
     value: Optional[int]
+    sectors: Optional[tuple["CacheSectorView", ...]] = None
+
+
+@dataclass(frozen=True)
+class CacheSectorView:
+    state: State
+    value: int
+    version: int
 
 
 @dataclass(frozen=True)
@@ -136,6 +164,18 @@ class DirectoryView:
     active_txn: Optional[int]
     awaiting_flush: bool
     awaiting_acks: tuple[int, ...]
+    sectors: Optional[tuple["DirectorySectorView", ...]] = None
+
+
+@dataclass(frozen=True)
+class DirectorySectorView:
+    state: State
+    sharers: tuple[int, ...]
+    owner: Optional[int]
+    active_txn: Optional[int]
+    awaiting_flush: tuple[tuple[int, int], ...]
+    awaiting_acks: tuple[int, ...]
+    version: int
 
 
 @dataclass(frozen=True)
@@ -145,6 +185,7 @@ class QueuedRequestView:
     addr: int
     op: Op
     value: Optional[int]
+    sectors: int = ALL_SECTORS
 
 
 @dataclass(frozen=True)
@@ -206,6 +247,34 @@ class _Txn:
     awaiting_flush: bool          # 正在等 owner 的 FLUSH
     awaiting_acks: set[int]       # 尚待 INV_ACK 的核集合
     flush_owner: Optional[int]    # FLUSH 阶段前的 owner
+
+
+@dataclass
+class _SectorState:
+    state: State = State.INVALID
+    sharers: set[int] = field(default_factory=set)
+    owner: Optional[int] = None
+    txn: Optional["_SectorTxn"] = None
+    version: int = 0
+
+
+@dataclass
+class _SectorCacheLine:
+    state: State = State.INVALID
+    value: int = 0
+    version: int = 0
+
+
+@dataclass
+class _SectorTxn:
+    txn_id: int
+    core: int
+    addr: int
+    op: Op
+    value: Optional[int]
+    sectors: int
+    awaiting_flush: dict[int, int] = field(default_factory=dict)
+    awaiting_acks: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -290,6 +359,7 @@ def _validate_request(req: object, *, request_seq: Optional[int]) -> Request:
             raise InvalidRequestError(
                 f"txn_id 必须为正整数，收到 {req.txn_id}",
                 request_seq=request_seq, field="txn_id")
+    _check_sector_mask(req.sectors)
     return req
 
 
@@ -306,7 +376,10 @@ class CacheCoherenceKernel:
                 值必须是 int（bool / float / NaN / Infinity 一律拒绝）。
     """
 
-    def __init__(self, memory: Optional[dict[int, int]] = None) -> None:
+    def __init__(self, memory: Optional[dict[int, int]] = None,
+                 *,
+                 sector_values: Optional[dict[tuple[int, int], int]] = None,
+                 sector_mode: bool = False) -> None:
         if memory is not None and not isinstance(memory, dict):
             raise InvalidRequestError("memory 必须是 dict[int, int]",
                                       field="memory")
@@ -317,10 +390,33 @@ class CacheCoherenceKernel:
                 _check_int("memory value", value)
                 mem[addr] = value
         self._memory: list[int] = mem
+        self._sector_mode = bool(sector_mode)
+        self._sector_memory: list[list[int]] = [list(mem) for _ in range(NUM_ADDRS)]
+        if sector_values:
+            if not isinstance(sector_values, dict):
+                raise InvalidRequestError("sector_values 必须是 dict[(addr, sector), int]",
+                                          field="sector_values")
+            for (addr, sector), value in sector_values.items():
+                _check_addr(addr)
+                _check_int("sector", sector)
+                if not 0 <= sector < NUM_SECTORS:
+                    raise InvalidRequestError(
+                        f"sector 必须在 [0,{NUM_SECTORS})，收到 {sector}",
+                        field="sector")
+                _check_int("sector value", value)
+                self._sector_memory[addr][sector] = value
         self._dir: list[_DirEntry] = [_DirEntry() for _ in range(NUM_ADDRS)]
+        self._sector_dir: list[list[_SectorState]] = [
+            [_SectorState() for _ in range(NUM_SECTORS)] for _ in range(NUM_ADDRS)
+        ]
         self._caches: list[dict[int, _CacheLine]] = [
             {a: _CacheLine() for a in range(NUM_ADDRS)} for _ in range(NUM_CORES)
         ]
+        self._sector_caches: list[list[list[_SectorCacheLine]]] = [
+            [[_SectorCacheLine() for _ in range(NUM_SECTORS)]
+             for _ in range(NUM_ADDRS)] for _ in range(NUM_CORES)
+        ]
+        self._sector_txns: dict[int, _SectorTxn] = {}
         self._pending: dict[int, Message] = {}
         self._history: dict[int, Message] = {}
         self._completed: list[Completion] = []
@@ -338,6 +434,10 @@ class CacheCoherenceKernel:
     def num_addrs(self) -> int:
         return NUM_ADDRS
 
+    @property
+    def sector_mode(self) -> bool:
+        return self._sector_mode
+
     def pending(self) -> tuple[Message, ...]:
         """当前待发（待投递）消息，按 msg_id 升序。"""
         return tuple(self._pending[i] for i in sorted(self._pending))
@@ -347,9 +447,35 @@ class CacheCoherenceKernel:
 
     def snapshot(self) -> Snapshot:
         """返回当前状态的只读视图（内容已拷贝，调用方修改不影响内核）。"""
+        sector_caches = None
+        sector_directory = None
+        if self._sector_mode:
+            sector_caches = tuple(
+                tuple(tuple(CacheSectorView(line.state, line.value, line.version)
+                            for line in addr_lines)
+                      for addr_lines in cache)
+                for cache in self._sector_caches
+            )
+            sector_directory = tuple(
+                tuple(DirectorySectorView(
+                    sector.state,
+                    tuple(sorted(sector.sharers)),
+                    sector.owner,
+                    sector.txn.txn_id if sector.txn else None,
+                    tuple(sorted(sector.txn.awaiting_flush.items()))
+                    if sector.txn else (),
+                    tuple(sorted(sector.txn.awaiting_acks))
+                    if sector.txn else (),
+                    sector.version,
+                ) for sector in addr_sectors)
+                for addr_sectors in self._sector_dir
+            )
         caches = tuple(
-            {a: CacheView(line.state, line.value) for a, line in cache.items()}
-            for cache in self._caches
+            {a: CacheView(
+                line.state, line.value,
+                sector_caches[c][a] if self._sector_mode else None)
+             for a, line in cache.items()}
+            for c, cache in enumerate(self._caches)
         )
         directory = tuple(
             DirectoryView(
@@ -359,12 +485,14 @@ class CacheCoherenceKernel:
                 e.txn.txn_id if e.txn is not None else None,
                 bool(e.txn.awaiting_flush) if e.txn is not None else False,
                 tuple(sorted(e.txn.awaiting_acks)) if e.txn is not None else (),
+                sector_directory[a] if self._sector_mode else None,
             )
-            for e in self._dir
+            for a, e in enumerate(self._dir)
         )
         queues = tuple(
             tuple(
-                QueuedRequestView(r.txn_id, r.core, r.addr, r.op, r.value)
+                QueuedRequestView(r.txn_id, r.core, r.addr, r.op, r.value,
+                                  r.sectors)
                 for r in e.queue
             )
             for e in self._dir
@@ -372,7 +500,8 @@ class CacheCoherenceKernel:
         return Snapshot(
             caches=caches,
             directory=directory,
-            memory=tuple(self._memory),
+            memory=tuple(tuple(row) for row in self._sector_memory)
+                     if self._sector_mode else tuple(self._memory),
             pending_messages=self.pending(),
             queues=queues,
             completed=tuple(self._completed),
@@ -382,14 +511,15 @@ class CacheCoherenceKernel:
 
     def request(self, core: int, addr: int, op: Op, *,
                 value: Optional[int] = None,
-                txn_id: Optional[int] = None) -> RequestReport:
+                txn_id: Optional[int] = None,
+                sectors: int = ALL_SECTORS) -> RequestReport:
         """输入一条 load/store 请求。
 
         该地址有活动事务或已有排队请求时进入 FIFO 队列（queued=True）；
         无消息即可满足的请求（I/S 命中、I 上写、独占 S 升级）在本次调用内完成。
         """
         req = _validate_request(
-            Request(core, addr, op, value, txn_id), request_seq=0)
+            Request(core, addr, op, value, txn_id, sectors), request_seq=0)
         return self._admit(req)
 
     def request_batch(self, requests: Iterable[Request]) -> list[RequestReport]:
@@ -435,7 +565,7 @@ class CacheCoherenceKernel:
     def _admit(self, req: Request) -> RequestReport:
         if req.txn_id is None:
             req = Request(req.core, req.addr, req.op, req.value,
-                          self._alloc_txn())
+                          self._alloc_txn(), req.sectors)
         elif req.txn_id in self._used_txn:
             raise InvalidRequestError(
                 f"txn_id={req.txn_id} 已被使用", field="txn_id")
@@ -443,6 +573,8 @@ class CacheCoherenceKernel:
             self._used_txn.add(req.txn_id)
             if req.txn_id >= self._next_txn:
                 self._next_txn = req.txn_id + 1
+        if self._sector_mode:
+            return self._admit_sector(req)
         entry = self._dir[req.addr]
         if entry.txn is not None or entry.queue:
             entry.queue.append(req)
@@ -536,14 +668,250 @@ class CacheCoherenceKernel:
         nxt = entry.queue.pop(0)
         done.extend(self._start(nxt, entry))
 
+    # -- 固定四扇区模式 -----------------------------------------------------
+
+    def _admit_sector(self, req: Request) -> RequestReport:
+        if req.txn_id is None:
+            req = Request(req.core, req.addr, req.op, req.value,
+                          self._alloc_txn(), req.sectors)
+        else:
+            self._used_txn.add(req.txn_id)
+            if req.txn_id >= self._next_txn:
+                self._next_txn = req.txn_id + 1
+        busy = any(
+            self._sector_dir[req.addr][s].txn is not None
+            for s in _iter_sectors(req.sectors)
+        )
+        if busy:
+            self._dir[req.addr].queue.append(req)
+            return RequestReport(req.txn_id, True, ())
+        done = self._start_sector(req)
+        return RequestReport(req.txn_id, False, tuple(done))
+
+    def _start_sector(self, req: Request) -> list[Completion]:
+        txn = _SectorTxn(req.txn_id, req.core, req.addr, req.op,
+                         req.value, req.sectors)
+        self._sector_txns[req.txn_id] = txn
+        for sector in _iter_sectors(req.sectors):
+            self._sector_dir[req.addr][sector].txn = txn
+        fetches: dict[int, int] = {}
+        invalidates: dict[int, int] = {}
+        for sector in _iter_sectors(req.sectors):
+            state = self._sector_dir[req.addr][sector]
+            cache = self._sector_caches[req.core][req.addr][sector]
+            if req.op is Op.LOAD and cache.state is State.SHARED:
+                continue
+            if req.op is Op.STORE and cache.state is State.MODIFIED:
+                continue
+            if state.state is State.MODIFIED and state.owner is not None:
+                if state.owner == req.core:
+                    continue
+                fetches[state.owner] = fetches.get(state.owner, 0) | (1 << sector)
+                continue
+            if req.op is Op.LOAD:
+                continue
+            for sharer in list(state.sharers):
+                if sharer != req.core:
+                    invalidates[sharer] = invalidates.get(sharer, 0) | (1 << sector)
+        for owner, mask in fetches.items():
+            txn.awaiting_flush[owner] = mask
+        for target, mask in invalidates.items():
+            txn.awaiting_acks[target] = txn.awaiting_acks.get(target, 0) | mask
+        if not txn.awaiting_flush and not txn.awaiting_acks:
+            return self._complete_sector_txn(txn)
+        for owner, mask in fetches.items():
+            self._send(MsgType.FETCH, DIR, owner, req.addr, req.txn_id,
+                       None, mask)
+        for target, mask in invalidates.items():
+            self._send(MsgType.INV, DIR, target, req.addr, req.txn_id,
+                       None, mask)
+        return []
+
+    def _sector_txn_for_message(self, msg: Message):
+        txn = self._sector_txns.get(msg.txn_id)
+        if txn is None or txn.addr != msg.addr:
+            return None
+        active = {self._sector_dir[msg.addr][s].txn.txn_id
+                  for s in _iter_sectors(msg.sectors)
+                  if self._sector_dir[msg.addr][s].txn is not None}
+        if active != {msg.txn_id}:
+            return None
+        return txn
+
+    def _pump_sector_queues(self, addr: int, done: list[Completion]) -> None:
+        entry = self._dir[addr]
+        progressed = True
+        while progressed:
+            progressed = False
+            for idx, req in enumerate(entry.queue):
+                if all(self._sector_dir[addr][s].txn is None
+                       for s in _iter_sectors(req.sectors)):
+                    entry.queue.pop(idx)
+                    done.extend(self._start_sector(req))
+                    progressed = True
+                    break
+
+    def _complete_sector_txn(self, txn: _SectorTxn) -> list[Completion]:
+        done: list[Completion] = []
+        addr = txn.addr
+        values: list[int] = [0] * NUM_SECTORS
+        for sector in _iter_sectors(txn.sectors):
+            state = self._sector_dir[addr][sector]
+            cache = self._sector_caches[txn.core][addr][sector]
+            if txn.op is Op.STORE:
+                state.state = State.MODIFIED
+                state.owner = txn.core
+                state.sharers.clear()
+                state.version += 1
+                state.txn = None
+                cache.state = State.MODIFIED
+                cache.value = txn.value
+                cache.version = state.version
+                values[sector] = txn.value
+            else:
+                value = (cache.value
+                         if cache.state is State.MODIFIED and state.owner == txn.core
+                         else self._sector_memory[addr][sector])
+                state.txn = None
+                if not (cache.state is State.MODIFIED and state.owner == txn.core):
+                    state.state = State.SHARED
+                    state.owner = None
+                    state.sharers.add(txn.core)
+                    cache.state = State.SHARED
+                    cache.value = value
+                    cache.version = state.version
+                values[sector] = value
+        self._sector_txns.pop(txn.txn_id, None)
+        if txn.sectors.bit_count() == 1:
+            only_sector = txn.sectors.bit_length() - 1
+            value = values[only_sector]
+        else:
+            value = tuple(values)
+        comp = Completion(txn.txn_id, txn.core, addr, txn.op, value,
+                          txn.sectors)
+        self._completed.append(comp)
+        done.append(comp)
+        self._pump_sector_queues_from(addr, done)
+        return done
+
+    def _pump_sector_queues_from(self, addr: int,
+                                 done: list[Completion]) -> None:
+        entry = self._dir[addr]
+        while True:
+            for idx, queued in enumerate(entry.queue):
+                if all(self._sector_dir[addr][s].txn is None
+                       for s in _iter_sectors(queued.sectors)):
+                    entry.queue.pop(idx)
+                    done.extend(self._start_sector(queued))
+                    break
+            else:
+                return
+
+    def _apply_sector(self, msg: Message, done: list[Completion]) -> Optional[str]:
+        txn = self._sector_txn_for_message(msg)
+        if txn is None:
+            return (f"扇区掩码 {msg.sectors:04b} 的消息属于事务 {msg.txn_id}，"
+                    "不是这些扇区当前等待的事务，不推进新事务")
+        if msg.mtype is MsgType.FETCH:
+            if txn.awaiting_flush.get(msg.dst, 0) & msg.sectors != msg.sectors:
+                return "FETCH 的扇区不在该事务等待此 owner 回写的掩码中"
+            for sector in _iter_sectors(msg.sectors):
+                line = self._sector_caches[msg.dst][msg.addr][sector]
+                if line.state is not State.MODIFIED:
+                    raise InvalidMessageError(
+                        f"FETCH 到达时核 {msg.dst} 扇区 {sector} 不是 M",
+                        msg_id=msg.msg_id)
+                line.state = State.SHARED
+            for mid, pending in list(self._pending.items()):
+                if (pending.txn_id == msg.txn_id
+                        and pending.mtype is MsgType.INV
+                        and pending.dst == msg.dst
+                        and pending.sectors & msg.sectors):
+                    del self._pending[mid]
+            payload = tuple(
+                line.value if msg.sectors & (1 << sector) else 0
+                for sector, line in enumerate(
+                    self._sector_caches[msg.dst][msg.addr]))
+            self._send(MsgType.FLUSH, msg.dst, DIR, msg.addr, msg.txn_id,
+                       payload, msg.sectors)
+            return None
+        if msg.mtype is MsgType.FLUSH:
+            if txn.awaiting_flush.get(msg.src, 0) & msg.sectors != msg.sectors:
+                return "FLUSH 的扇区不在该事务等待回写的掩码中"
+            for sector in _iter_sectors(msg.sectors):
+                incoming = msg.value[sector]
+                line = self._sector_caches[msg.src][msg.addr][sector]
+                if line.state is not State.SHARED:
+                    raise InvalidMessageError(
+                        f"FLUSH 时核 {msg.src} 扇区 {sector} 不是回写在途 S",
+                        msg_id=msg.msg_id)
+                line.value = incoming
+                line.version = self._sector_dir[msg.addr][sector].version
+                self._sector_memory[msg.addr][sector] = incoming
+                state = self._sector_dir[msg.addr][sector]
+                state.state = State.SHARED
+                state.owner = None
+                state.sharers.add(msg.src)
+                if txn.op is Op.STORE:
+                    state.sharers.discard(msg.src)
+                    line.state = State.INVALID
+            txn.awaiting_flush[msg.src] &= ~msg.sectors
+            if not txn.awaiting_flush[msg.src]:
+                del txn.awaiting_flush[msg.src]
+            if txn.op is Op.STORE:
+                stale_inv_ids = [
+                    mid for mid, pending in self._pending.items()
+                    if pending.txn_id == msg.txn_id
+                    and pending.mtype is MsgType.INV
+                    and pending.dst == msg.src
+                    and pending.sectors & msg.sectors
+                ]
+                for mid in stale_inv_ids:
+                    del self._pending[mid]
+            if not txn.awaiting_flush and not txn.awaiting_acks:
+                done.extend(self._complete_sector_txn(txn))
+            return None
+        if msg.mtype is MsgType.INV:
+            if txn.awaiting_acks.get(msg.dst, 0) & msg.sectors != msg.sectors:
+                return "INV 的扇区不在该事务等待此核确认的掩码中"
+            for sector in _iter_sectors(msg.sectors):
+                line = self._sector_caches[msg.dst][msg.addr][sector]
+                if line.state is not State.SHARED:
+                    raise InvalidMessageError(
+                        f"INV 到达时核 {msg.dst} 扇区 {sector} 不是 S",
+                        msg_id=msg.msg_id)
+                line.state = State.INVALID
+            self._send(MsgType.INV_ACK, msg.dst, DIR, msg.addr, msg.txn_id,
+                       None, msg.sectors)
+            return None
+        if msg.mtype is MsgType.INV_ACK:
+            if txn.awaiting_acks.get(msg.src, 0) & msg.sectors != msg.sectors:
+                return "INV_ACK 的扇区不在该事务等待此核确认的掩码中"
+            for sector in _iter_sectors(msg.sectors):
+                line = self._sector_caches[msg.src][msg.addr][sector]
+                if line.state is not State.INVALID:
+                    raise InvalidMessageError(
+                        f"INV_ACK 时核 {msg.src} 扇区 {sector} 尚未失效",
+                        msg_id=msg.msg_id)
+                self._sector_dir[msg.addr][sector].sharers.discard(msg.src)
+            txn.awaiting_acks[msg.src] &= ~msg.sectors
+            if not txn.awaiting_acks[msg.src]:
+                del txn.awaiting_acks[msg.src]
+            if not txn.awaiting_flush and not txn.awaiting_acks:
+                done.extend(self._complete_sector_txn(txn))
+            return None
+        raise InvalidMessageError(f"未知消息类型 {msg.mtype!r}",
+                                  field="mtype")
+
     # -- 消息 ---------------------------------------------------------------
 
     def _send(self, mtype: MsgType, src: int, dst: int, addr: int,
-              txn_id: int, value: Optional[int] = None) -> int:
+              txn_id: int, value: Optional[object] = None,
+              sectors: int = ALL_SECTORS) -> int:
         msg_id = self._next_msg
         self._next_msg += 1
         self._pending[msg_id] = Message(
-            msg_id, txn_id, mtype, src, dst, addr, value)
+            msg_id, txn_id, mtype, src, dst, addr, value, sectors)
         return msg_id
 
     def deliver(self, what: Union[int, Message]) -> DeliveryReport:
@@ -580,7 +948,8 @@ class CacheCoherenceKernel:
 
         before = set(self._pending)
         done: list[Completion] = []
-        stale_reason = self._apply(msg, done)
+        stale_reason = (self._apply_sector(msg, done) if self._sector_mode
+                        else self._apply(msg, done))
         new_msgs = tuple(m for i, m in self._pending.items() if i not in before)
         if not injected:
             del self._pending[msg.msg_id]
@@ -629,13 +998,25 @@ class CacheCoherenceKernel:
                     f"{mtype.value} 必须 src 为核号且 dst=DIR({DIR})",
                     field="src/dst")
         if mtype is MsgType.FLUSH:
-            _check_int("value", msg.value, msg=True)
+            if self._sector_mode:
+                if not isinstance(msg.value, tuple) or len(msg.value) != NUM_SECTORS:
+                    raise InvalidMessageError(
+                        f"扇区模式 FLUSH value 必须是长度 {NUM_SECTORS} 的 tuple",
+                        field="value")
+                for idx, item in enumerate(msg.value):
+                    _check_int(f"FLUSH value[{idx}]", item, msg=True)
+            else:
+                _check_int("value", msg.value, msg=True)
         elif msg.value is not None:
             raise InvalidMessageError(
                 f"{mtype.value} 消息不能带 value", field="value")
         if msg.txn_id not in self._used_txn:
             raise InvalidMessageError(
                 f"txn_id={msg.txn_id} 从未在本内核注册过", field="txn_id")
+        _check_sector_mask(msg.sectors, msg=True)
+        if not self._sector_mode and msg.sectors != ALL_SECTORS:
+            raise InvalidMessageError(
+                "默认整行模式只接受四扇区全掩码", field="sectors")
         return msg
 
     # -- 消息生效（返回 None 表示生效，返回 str 表示陈旧忽略原因） -----------

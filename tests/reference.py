@@ -83,3 +83,48 @@ def per_address_store_order(completions: Iterable[FlatCompletion]
         if op == "store":
             order[addr].append(value)
     return dict(order)
+
+
+SectorCompletion = tuple[int, str, object, int]
+
+
+def check_sector_completion_sequence(
+    completions: Iterable[SectorCompletion],
+    initial_memory: dict[tuple[int, int], int] | None = None,
+    num_addrs: int = 8,
+    num_sectors: int = 4,
+) -> None:
+    """独立扇区账本：按完成顺序逐扇区核对 load 可见值。
+
+    该函数不导入被测内核。store 只更新其掩码覆盖的扇区；跨扇区 load
+    返回长度为 num_sectors 的 tuple 时，只核对该事务掩码请求的扇区。
+    """
+    memory = [[0 for _ in range(num_sectors)] for _ in range(num_addrs)]
+    if initial_memory:
+        for (addr, sector), value in initial_memory.items():
+            memory[addr][sector] = value
+    load_index = 0
+    for addr, op, value, mask in completions:
+        sectors = [s for s in range(num_sectors) if mask & (1 << s)]
+        if op == "store":
+            if not isinstance(value, int):
+                raise ReferenceViolation(f"第 {load_index} 个 store 值不是 int")
+            for sector in sectors:
+                memory[addr][sector] = value
+        elif op == "load":
+            if len(sectors) == 1:
+                actuals = {sectors[0]: value}
+            else:
+                if not isinstance(value, tuple) or len(value) != num_sectors:
+                    raise ReferenceViolation(
+                        f"第 {load_index} 个跨扇区 load 未返回 {num_sectors} 元组")
+                actuals = {sector: value[sector] for sector in sectors}
+            for sector in sectors:
+                want = memory[addr][sector]
+                if actuals[sector] != want:
+                    raise ReferenceViolation(
+                        f"第 {load_index} 个 load（地址 {addr} 扇区 {sector}）"
+                        f"读到 {actuals[sector]}，账本允许 {want}")
+            load_index += 1
+        else:
+            raise ValueError(f"参考模型未知 op: {op!r}")

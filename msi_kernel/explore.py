@@ -20,7 +20,9 @@ from typing import Callable, Optional, Sequence
 
 from .errors import BudgetExhaustedError, InfeasibleError
 from .model import (
+    ALL_SECTORS,
     NUM_ADDRS,
+    NUM_SECTORS,
     NUM_CORES,
     CacheCoherenceKernel,
     Completion,
@@ -76,17 +78,34 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     )
     # 待发消息只按“类型/源/目的/地址/事务”的多重集计，与具体 id 无关。
     pend = tuple(sorted(
-        (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value)
+        (m.mtype.value, m.src, m.dst, m.addr, m.txn_id, m.value, m.sectors)
         for m in snap.pending_messages
     ))
     queues = tuple(
-        tuple((q.txn_id, q.core, q.op.value, q.value) for q in qq)
+        tuple((q.txn_id, q.core, q.op.value, q.value, q.sectors) for q in qq)
         for qq in snap.queues
     )
     completed = tuple(
         (c.txn_id, c.op.value, c.value) for c in snap.completed
     )
-    return caches, directory, snap.memory, pend, queues, completed
+    sectors = ()
+    if kernel.sector_mode:
+        sector_caches = tuple(
+            tuple(
+                tuple(
+                    (line.state.value, line.value, line.version)
+                    for line in snap.caches[c][a].sectors)
+                for a in range(NUM_ADDRS))
+            for c in range(NUM_CORES))
+        sector_dirs = tuple(
+            tuple(
+                tuple(
+                    (d.state.value, d.sharers, d.owner, d.active_txn,
+                     tuple(d.awaiting_flush), d.awaiting_acks, d.version)
+                    for d in snap.directory[a].sectors)
+                for a in range(NUM_ADDRS)))
+        sectors = (sector_caches, sector_dirs)
+    return caches, directory, snap.memory, pend, queues, completed, sectors
 
 
 def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
@@ -135,6 +154,51 @@ def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:
                 return f"addr={a}: 目录 I 但 owner={d.owner} 非空"
             if any(s is not State.INVALID for s in states.values()):
                 return f"addr={a}: 目录 I 却存在非 I 缓存"
+    if kernel.sector_mode:
+        for a in range(NUM_ADDRS):
+            for s_idx in range(NUM_SECTORS):
+                ds = snap.directory[a].sectors[s_idx]
+                cache_states = {
+                    c: snap.caches[c][a].sectors[s_idx].state
+                    for c in range(NUM_CORES)
+                }
+                writers = [c for c, st in cache_states.items()
+                           if st is State.MODIFIED]
+                readers = [c for c, st in cache_states.items()
+                           if st is State.SHARED]
+                if len(writers) > 1:
+                    return f"addr={a} sector={s_idx}: 多个 M {writers}"
+                if writers and readers:
+                    return f"addr={a} sector={s_idx}: M {writers} 与 S {readers} 共存"
+                if ds.state is State.MODIFIED:
+                    owner_state = cache_states[ds.owner] if ds.owner is not None else None
+                    if ds.owner is None or owner_state not in (
+                            State.MODIFIED, State.SHARED):
+                        return f"addr={a} sector={s_idx}: 目录 M owner 无对应缓存 M"
+                    if set(readers) - ({ds.owner} if ds.awaiting_flush else set()):
+                        return f"addr={a} sector={s_idx}: M owner 外存在 S"
+                elif ds.state is State.SHARED:
+                    if ds.owner is not None:
+                        return f"addr={a} sector={s_idx}: S 状态 owner 非空"
+                    unlisted = [c for c in readers if c not in ds.sharers]
+                    if unlisted:
+                        return f"addr={a} sector={s_idx}: S {unlisted} 未登记"
+                else:
+                    if readers or writers or ds.owner is not None:
+                        return f"addr={a} sector={s_idx}: I 状态存在缓存/owner"
+        txns = {}
+        for a in range(NUM_ADDRS):
+            for s_idx in range(NUM_SECTORS):
+                tid = snap.directory[a].sectors[s_idx].active_txn
+                if tid is not None:
+                    txns.setdefault(tid, [set(), set()])[0].add(a)
+                    txns[tid][1].add(s_idx)
+        for tid, groups in txns.items():
+            addrs, sectors = groups
+            if len(addrs) != 1:
+                return f"txn={tid}: 跨地址绑定 {addrs}"
+            if not sectors:
+                return f"txn={tid}: 空扇区集合"
     return None
 
 
