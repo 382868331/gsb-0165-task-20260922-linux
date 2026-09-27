@@ -6,7 +6,9 @@
   * deliver(msg_id: int)  投递内核待发队列中的消息（正常驱动路径）；
   * deliver(Message(...)) 显式注入一条网络消息（msg_id 传 None），
     用于表达乱序 / 重复 / 陈旧报文等外部网络输入；
-- 内核不自行丢消息、不自行乱序，pending 消息队列对调用方可见可枚举。
+- 内核不自行丢消息、不自行乱序；drop_message 显式模拟丢失，
+  advance_time 显式推进逻辑时钟并触发目录超时重传；
+  pending 消息队列对调用方可见可枚举。
 
 协议子集（固定规模 NUM_CORES=3, NUM_ADDRS=8）：
 - 每核每地址缓存行为 I / S / M；
@@ -68,6 +70,12 @@ class DeliveryStatus(str, Enum):
     APPLIED = "applied"             # 正常生效
     IGNORED_DUPLICATE = "duplicate"  # 同一 msg_id 已投递过，幂等忽略
     IGNORED_STALE = "stale"          # 报文与当前活动事务不符（如陈旧 ACK），不推进新事务
+
+
+class LossStatus(str, Enum):
+    """显式丢包结果。"""
+
+    LOST = "lost"
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +144,7 @@ class DirectoryView:
     active_txn: Optional[int]
     awaiting_flush: bool
     awaiting_acks: tuple[int, ...]
+    timeouts: tuple[tuple[int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -175,6 +184,23 @@ class DeliveryReport:
 
 
 @dataclass(frozen=True)
+class TimeoutReport:
+    """advance_time 的离散时钟推进结果。"""
+
+    time: int
+    retransmitted: tuple[Message, ...]
+
+
+@dataclass(frozen=True)
+class LossReport:
+    """drop_message 的显式丢包结果。"""
+
+    msg_id: int
+    message: Message
+    status: LossStatus
+
+
+@dataclass(frozen=True)
 class Snapshot:
     caches: tuple[dict[int, CacheView], ...]
     directory: tuple[DirectoryView, ...]
@@ -182,6 +208,7 @@ class Snapshot:
     pending_messages: tuple[Message, ...]
     queues: tuple[tuple[QueuedRequestView, ...], ...]
     completed: tuple[Completion, ...]
+    time: int
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +220,7 @@ class Snapshot:
 class _CacheLine:
     state: State = State.INVALID
     value: Optional[int] = None
+    last_dir_txn: Optional[int] = None
 
 
 @dataclass
@@ -206,6 +234,7 @@ class _Txn:
     awaiting_flush: bool          # 正在等 owner 的 FLUSH
     awaiting_acks: set[int]       # 尚待 INV_ACK 的核集合
     flush_owner: Optional[int]    # FLUSH 阶段前的 owner
+    deadlines: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -306,7 +335,9 @@ class CacheCoherenceKernel:
                 值必须是 int（bool / float / NaN / Infinity 一律拒绝）。
     """
 
-    def __init__(self, memory: Optional[dict[int, int]] = None) -> None:
+    def __init__(self, memory: Optional[dict[int, int]] = None,
+                 *,
+                 timeout_ticks: int = 10) -> None:
         if memory is not None and not isinstance(memory, dict):
             raise InvalidRequestError("memory 必须是 dict[int, int]",
                                       field="memory")
@@ -316,6 +347,10 @@ class CacheCoherenceKernel:
                 _check_addr(addr)
                 _check_int("memory value", value)
                 mem[addr] = value
+        _check_int("timeout_ticks", timeout_ticks)
+        if timeout_ticks <= 0:
+            raise InvalidRequestError(
+                "timeout_ticks 必须为正整数", field="timeout_ticks")
         self._memory: list[int] = mem
         self._dir: list[_DirEntry] = [_DirEntry() for _ in range(NUM_ADDRS)]
         self._caches: list[dict[int, _CacheLine]] = [
@@ -327,6 +362,8 @@ class CacheCoherenceKernel:
         self._used_txn: set[int] = set()
         self._next_txn = 1
         self._next_msg = 1
+        self._time = 0
+        self._timeout = timeout_ticks
 
     # -- 观测 ---------------------------------------------------------------
 
@@ -359,6 +396,7 @@ class CacheCoherenceKernel:
                 e.txn.txn_id if e.txn is not None else None,
                 bool(e.txn.awaiting_flush) if e.txn is not None else False,
                 tuple(sorted(e.txn.awaiting_acks)) if e.txn is not None else (),
+                tuple(sorted(e.txn.deadlines.items())) if e.txn is not None else (),
             )
             for e in self._dir
         )
@@ -376,7 +414,13 @@ class CacheCoherenceKernel:
             pending_messages=self.pending(),
             queues=queues,
             completed=tuple(self._completed),
+            time=self._time,
         )
+
+    @property
+    def time(self) -> int:
+        """当前离散模拟时间（由调用方显式推进）。"""
+        return self._time
 
     # -- 请求输入 -----------------------------------------------------------
 
@@ -479,7 +523,8 @@ class CacheCoherenceKernel:
             entry.txn = _Txn(req.txn_id, core, Op.LOAD, None,
                              awaiting_flush=True, awaiting_acks=set(),
                              flush_owner=owner)
-            self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
+            mid = self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
+            entry.txn.deadlines[owner] = self._time + self._timeout
             return done
 
         # STORE
@@ -511,6 +556,7 @@ class CacheCoherenceKernel:
                              flush_owner=None)
             for c in sorted(targets):
                 self._send(MsgType.INV, DIR, c, addr, req.txn_id)
+                entry.txn.deadlines[c] = self._time + self._timeout
             return done
         # 目录 M、owner 为别的核：先回写，再失效旧 owner，最后升级。
         owner = entry.owner
@@ -518,6 +564,7 @@ class CacheCoherenceKernel:
         entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value,
                          awaiting_flush=True, awaiting_acks=set(),
                          flush_owner=owner)
+        entry.txn.deadlines[owner] = self._time + self._timeout
         self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
         return done
 
@@ -545,6 +592,51 @@ class CacheCoherenceKernel:
         self._pending[msg_id] = Message(
             msg_id, txn_id, mtype, src, dst, addr, value)
         return msg_id
+
+    def advance_time(self, ticks: int = 1) -> TimeoutReport:
+        """推进离散模拟时间，并重传所有已超时的目录请求。
+
+        ticks 必须为正整数（bool 拒绝）。内核没有真实时钟和定时器线程；
+        只有调用方显式调用本方法时时间才会前进。重传生成新 msg_id，
+        原报文若以后迟到仍按重复/陈旧规则处理。
+        """
+        _check_int("ticks", ticks)
+        if ticks <= 0:
+            raise InvalidRequestError("ticks 必须为正整数", field="ticks")
+        self._time += ticks
+        emitted: list[Message] = []
+        for addr, entry in enumerate(self._dir):
+            txn = entry.txn
+            if txn is None:
+                continue
+            for target in sorted(txn.deadlines):
+                if txn.deadlines[target] > self._time:
+                    continue
+                if txn.awaiting_flush and target == txn.flush_owner:
+                    mtype = MsgType.FETCH
+                    value = None
+                elif target in txn.awaiting_acks:
+                    mtype = MsgType.INV
+                    value = None
+                else:
+                    txn.deadlines.pop(target, None)
+                    continue
+                mid = self._send(mtype, DIR, target, addr, txn.txn_id, value)
+                txn.deadlines[target] = self._time + self._timeout
+                emitted.append(self._pending[mid])
+        return TimeoutReport(self._time, tuple(emitted))
+
+    def drop_message(self, msg_id: int) -> LossReport:
+        """显式丢弃一条仍在待发队列中的消息，模拟网络丢失。"""
+        _check_int("msg_id", msg_id, msg=True)
+        msg = self._pending.pop(msg_id, None)
+        if msg is None:
+            if msg_id in self._history:
+                raise InvalidMessageError(
+                    f"msg_id={msg_id} 已投递，不能再标记为丢失", msg_id=msg_id)
+            raise InvalidMessageError(
+                f"msg_id={msg_id} 从不存在，无法丢弃", msg_id=msg_id)
+        return LossReport(msg_id, msg, LossStatus.LOST)
 
     def deliver(self, what: Union[int, Message]) -> DeliveryReport:
         """显式网络投递。
@@ -653,11 +745,19 @@ class CacheCoherenceKernel:
                         f"地址 {msg.addr} 当前活动事务为 "
                         f"{txn.txn_id if txn else None}，不推进新事务")
             owner_line = self._caches[msg.dst][msg.addr]
-            if owner_line.state is not State.MODIFIED:
+            if owner_line.state is State.MODIFIED:
+                owner_line.state = State.SHARED
+                owner_line.last_dir_txn = msg.txn_id
+            elif (owner_line.state is State.SHARED
+                  and owner_line.last_dir_txn == msg.txn_id):
+                # 重复 FETCH：第一次命令已降级，重放同一条 FLUSH；
+                # 不重复修改缓存，也不会让目录写内存超过一次。
+                pass
+            else:
                 raise InvalidMessageError(
-                    f"FETCH 到达时核 {msg.dst} 对地址 {msg.addr} 不是 M",
+                    f"FETCH 到达时核 {msg.dst} 对地址 {msg.addr} 不是 M "
+                    f"或本事务待重放的 S",
                     msg_id=msg.msg_id)
-            owner_line.state = State.SHARED
             self._send(MsgType.FLUSH, msg.dst, DIR, msg.addr,
                        msg.txn_id, owner_line.value)
             return None
@@ -671,12 +771,19 @@ class CacheCoherenceKernel:
                         f"地址 {msg.addr} 当前活动事务为 "
                         f"{txn.txn_id if txn else None}，不推进新事务")
             target_line = self._caches[msg.dst][msg.addr]
-            if target_line.state is not State.SHARED:
+            if target_line.state is State.SHARED:
+                target_line.state = State.INVALID
+                target_line.value = None
+                target_line.last_dir_txn = msg.txn_id
+            elif (target_line.state is State.INVALID
+                  and target_line.last_dir_txn == msg.txn_id):
+                # 重复 INV：缓存只失效一次，但安全重放 ACK。
+                pass
+            else:
                 raise InvalidMessageError(
-                    f"INV 到达时核 {msg.dst} 对地址 {msg.addr} 不是 S",
+                    f"INV 到达时核 {msg.dst} 对地址 {msg.addr} 不是 S "
+                    f"或本事务已失效的 I",
                     msg_id=msg.msg_id)
-            target_line.state = State.INVALID
-            target_line.value = None
             self._send(MsgType.INV_ACK, msg.dst, DIR, msg.addr, msg.txn_id)
             return None
 
@@ -688,6 +795,7 @@ class CacheCoherenceKernel:
                         f"（{txn.txn_id if txn else None}）不符，不推进新事务")
             self._memory[msg.addr] = msg.value
             old_owner = txn.flush_owner
+            txn.deadlines.pop(old_owner, None)
             entry.owner = None
             entry.state = State.SHARED
             entry.sharers = {old_owner}
@@ -711,6 +819,7 @@ class CacheCoherenceKernel:
             else:
                 for c in sorted(targets):
                     self._send(MsgType.INV, DIR, c, msg.addr, txn.txn_id)
+                    txn.deadlines[c] = self._time + self._timeout
             return None
 
         # INV_ACK
@@ -720,6 +829,7 @@ class CacheCoherenceKernel:
                     f"地址 {msg.addr} 当前活动事务为 "
                     f"{txn.txn_id if txn else None}，不推进新事务")
         txn.awaiting_acks.discard(msg.src)
+        txn.deadlines.pop(msg.src, None)
         entry.sharers.discard(msg.src)
         if not txn.awaiting_acks:
             self._finalize_store(msg.addr, txn, done)

@@ -71,7 +71,7 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     )
     directory = tuple(
         (d.state.value, d.sharers, d.owner, d.active_txn,
-         d.awaiting_flush, d.awaiting_acks)
+         d.awaiting_flush, d.awaiting_acks, d.timeouts)
         for d in snap.directory
     )
     # 待发消息只按“类型/源/目的/地址/事务”的多重集计，与具体 id 无关。
@@ -86,7 +86,7 @@ def descriptor(kernel: CacheCoherenceKernel) -> tuple:
     completed = tuple(
         (c.txn_id, c.op.value, c.value) for c in snap.completed
     )
-    return caches, directory, snap.memory, pend, queues, completed
+    return caches, directory, snap.memory, pend, queues, completed, snap.time
 
 
 def check_invariants(kernel: CacheCoherenceKernel) -> Optional[str]:

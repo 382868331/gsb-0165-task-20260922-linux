@@ -251,6 +251,77 @@ class TestQueueingAndIndependence(unittest.TestCase):
 
 
 class TestMessageSemantics(unittest.TestCase):
+    def test_lost_inv_is_retransmitted_after_caller_timeout(self):
+        k = CacheCoherenceKernel(memory={0: 0})
+        k.request_batch([
+            Request(0, 0, Op.LOAD),
+            Request(1, 0, Op.STORE, value=5),
+        ])
+        inv = k.pending()[0]
+        loss = k.drop_message(inv.msg_id)
+        self.assertEqual(loss.status.value, "lost")
+        self.assertEqual(k.pending(), ())
+        rep = k.advance_time(10)
+        self.assertEqual(k.time, 10)
+        self.assertEqual(len(rep.retransmitted), 1)
+        retry = rep.retransmitted[0]
+        self.assertEqual(retry.mtype, MsgType.INV)
+        self.assertEqual(retry.txn_id, inv.txn_id)
+        ack = k.deliver(retry.msg_id).emitted[0]
+        done = k.deliver(ack.msg_id)
+        self.assertEqual([c.value for c in done.completions], [5])
+
+    def test_lost_ack_causes_safe_inv_replay_and_single_store(self):
+        k = CacheCoherenceKernel(memory={0: 0})
+        k.request_batch([
+            Request(0, 0, Op.LOAD),
+            Request(1, 0, Op.STORE, value=5),
+        ])
+        inv = k.pending()[0]
+        ack = k.deliver(inv.msg_id).emitted[0]
+        k.drop_message(ack.msg_id)
+        self.assertEqual(
+            [c for c in k.completed() if c.op is Op.STORE], [])
+        retry = k.advance_time(10).retransmitted[0]
+        # 核端已经失效过一次；重复 INV 只重放 ACK，不再次改变缓存。
+        replay = k.deliver(retry.msg_id)
+        self.assertEqual(len(replay.emitted), 1)
+        self.assertIs(k.snapshot().caches[0][0].state, State.INVALID)
+        final = k.deliver(replay.emitted[0].msg_id)
+        self.assertEqual([c.value for c in final.completions], [5])
+        stores = [c for c in k.completed() if c.op is Op.STORE]
+        self.assertEqual(stores, [k.completed()[-1]])
+
+    def test_lost_flush_causes_safe_fetch_replay_and_single_writeback(self):
+        k = CacheCoherenceKernel(memory={0: 0})
+        k.request(0, 0, Op.STORE, value=7)
+        k.request(1, 0, Op.LOAD)
+        fetch = next(m for m in k.pending() if m.mtype is MsgType.FETCH)
+        flush = k.deliver(fetch.msg_id).emitted[0]
+        k.drop_message(flush.msg_id)
+        self.assertEqual(k.snapshot().memory[0], 0)
+        retry = k.advance_time(10).retransmitted[0]
+        replay_flush = k.deliver(retry.msg_id).emitted[0]
+        rep = k.deliver(replay_flush.msg_id)
+        self.assertEqual(rep.completions[0].value, 7)
+        self.assertEqual(k.snapshot().memory[0], 7)
+
+    def test_duplicate_outstanding_command_completes_once(self):
+        k = CacheCoherenceKernel(memory={0: 0})
+        k.request_batch([
+            Request(0, 0, Op.LOAD),
+            Request(1, 0, Op.STORE, value=5),
+        ])
+        original = k.pending()[0]
+        retry = k.advance_time(10).retransmitted[0]
+        ack1 = k.deliver(original.msg_id).emitted[0]
+        ack2 = k.deliver(retry.msg_id).emitted[0]
+        self.assertEqual(k.deliver(ack1.msg_id).completions[0].value, 5)
+        stale = k.deliver(ack2.msg_id)
+        self.assertIs(stale.status, DeliveryStatus.IGNORED_STALE)
+        stores = [c for c in k.completed() if c.op is Op.STORE]
+        self.assertEqual(len(stores), 1)
+
     def test_message_and_transaction_ids_are_unique(self):
         k = CacheCoherenceKernel(memory={0: 0})
         k.request_batch([

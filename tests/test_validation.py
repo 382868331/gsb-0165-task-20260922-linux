@@ -19,6 +19,20 @@ from msi_kernel import (
 
 
 class TestScalarValidation(unittest.TestCase):
+    def test_timeout_arguments_must_be_positive_ints(self):
+        with self.assertRaises(InvalidRequestError) as cm:
+            CacheCoherenceKernel(timeout_ticks=0)
+        self.assertEqual(cm.exception.field, "timeout_ticks")
+        with self.assertRaises(InvalidRequestError) as cm:
+            CacheCoherenceKernel(timeout_ticks=True)
+        self.assertEqual(cm.exception.field, "timeout_ticks")
+        with self.assertRaises(InvalidRequestError) as cm:
+            CacheCoherenceKernel().advance_time(0)
+        self.assertEqual(cm.exception.field, "ticks")
+        with self.assertRaises(InvalidRequestError) as cm:
+            CacheCoherenceKernel().advance_time(False)
+        self.assertEqual(cm.exception.field, "ticks")
+
     def test_bool_rejected_as_integer(self):
         with self.assertRaises(InvalidRequestError) as cm:
             CacheCoherenceKernel().request(True, 0, Op.LOAD)

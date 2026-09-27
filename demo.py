@@ -187,6 +187,38 @@ def part_c_boundaries():
         print(f"  5) 投递从不存在的 msg_id: {type(e).__name__}: {e}")
 
 
+def part_d_loss_and_retransmission():
+    print("=" * 72)
+    print("D. 丢失后超时重传：重复命令不重复写入或失效")
+    print("=" * 72)
+    k = CacheCoherenceKernel(memory={ADDR: 100}, timeout_ticks=10)
+    k.request_batch([
+        Request(0, ADDR, Op.LOAD),
+        Request(1, ADDR, Op.LOAD),
+        Request(1, ADDR, Op.STORE, value=200),
+    ])
+    inv_to_0 = next(m for m in k.pending() if m.dst == 0)
+    print(f"  网络丢失第一条 INV msg={inv_to_0.msg_id}")
+    k.drop_message(inv_to_0.msg_id)
+    before = k.advance_time(9)
+    print(f"  advance_time(9) -> time={before.time}，重传数="
+          f"{len(before.retransmitted)}（未到 10 tick 超时点）")
+    timeout = k.advance_time(1)
+    retry = timeout.retransmitted[0]
+    print(f"  advance_time(1) -> time={timeout.time}，重传 "
+          f"{retry.mtype.value} msg={retry.msg_id}，仍属于事务 "
+          f"{retry.txn_id}")
+    rep = k.deliver(retry.msg_id)
+    ack = rep.emitted[0]
+    done = k.deliver(ack.msg_id)
+    stores = [c for c in k.completed() if c.op is Op.STORE]
+    print(f"  重传 ACK 完成: {[(c.txn_id, c.value) for c in done.completions]}")
+    print(f"  本地址 store 完成次数={len(stores)}，最终 owner="
+          f"{k.snapshot().directory[ADDR].owner}")
+    assert len(stores) == 1
+    assert k.snapshot().caches[0][ADDR].state is State.INVALID
+
+
 def main():
     t0 = time.perf_counter()
     part_a_invalidation_chain()
@@ -194,6 +226,8 @@ def main():
     part_b_enumeration()
     print()
     part_c_boundaries()
+    print()
+    part_d_loss_and_retransmission()
     dt = time.perf_counter() - t0
     print("=" * 72)
     print(f"演示结束，实际计算耗时 {dt:.2f} 秒（无 sleep、无网络、无预录结果）。")
