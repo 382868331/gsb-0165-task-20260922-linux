@@ -26,6 +26,7 @@ from .model import (
     Completion,
     RequestReport,
     DeliveryReport,
+    TickReport,
     CacheCoherenceKernel,
 )
 from .explore import (
@@ -51,6 +52,7 @@ __all__ = [
     "Completion",
     "RequestReport",
     "DeliveryReport",
+    "TickReport",
     "CacheCoherenceKernel",
     "explore",
     "find_schedule",

@@ -4,8 +4,10 @@
 全程真实计算（无 sleep、无预录结果、无网络/线程），确定性输出。
 内容：
   A. 失效链逐步演示：3 核共享 -> 升级等齐 ACK -> 读 M 触发回写后共享；
-  B. 枚举小规模消息重排，逐状态检查“至多一个 M、M 时无 S”；
-  C. 实际触发的拒绝/异常边界（NaN、bool、未知 msg_id、重复/陈旧投递）。
+  B. 丢失与超时重传：丢 INV/FLUSH 后由 tick 推进模拟时钟触发重传，
+     原件与副本重复到达时幂等，一次写入只执行一遍；
+  C. 枚举小规模消息重排，逐状态检查“至多一个 M、M 时无 S”；
+  D. 实际触发的拒绝/异常边界（NaN、bool、未知 msg_id、重复/陈旧投递）。
 """
 
 import time
@@ -105,9 +107,48 @@ def part_a_invalidation_chain():
     print(f"  全部完成事件: {[(c.txn_id, f'核{c.core}', c.op.value, c.value) for c in s.completed]}")
 
 
-def part_b_enumeration():
+def part_b_loss_and_retransmit():
     print("=" * 72)
-    print("B. 枚举消息重排：最多一个 M；存在 M 时不得有 S")
+    print("B. 丢失与超时重传（tick 推进模拟时钟，重复到达幂等）")
+    print("=" * 72)
+    k = CacheCoherenceKernel(memory={ADDR: 100}, timeout=3)
+    k.request(0, ADDR, Op.LOAD)
+    k.request(1, ADDR, Op.STORE, value=200)
+    inv = k.pending()[0]
+    lost = k.lose(inv.msg_id)
+    print(f"  核1 store=200 的 INV(msg {lost.msg_id}) 被网络丢失，"
+          f"store 悬而未决（completed 最后仍是 load）")
+    print(f"  tick(2)：时钟={k.tick(2).clock}，未达 timeout=3，不重传")
+    rep = k.tick(1)
+    copy_inv = rep.retransmitted[0]
+    print(f"  tick(1)：时钟={rep.clock} 到达超时，目录重传 "
+          f"INV(msg {copy_inv.msg_id}) 给核{copy_inv.dst}")
+    ack = k.deliver(copy_inv.msg_id).emitted[0]
+    fin = k.deliver(ack.msg_id)
+    print(f"  重传副本生效：核0 失效并回 ACK，store 完成值="
+          f"{fin.completions[0].value}（只提交一次）")
+
+    # 重复到达：读 M 触发 FETCH，原件与重传副本都被投递。
+    k.request(2, ADDR, Op.LOAD)
+    fetch = k.pending()[0]
+    copy_fetch = k.tick(3).retransmitted[0]
+    flush1 = k.deliver(fetch.msg_id).emitted[0]
+    dup = k.deliver(copy_fetch.msg_id)
+    flush2 = dup.emitted[0]
+    print(f"  核2 读 M：FETCH 原件与超时重传副本都到达 owner，"
+          f"副本幂等补发 FLUSH(msg {flush2.msg_id})，owner 只降级一次")
+    k.deliver(flush1.msg_id)
+    rep2 = k.deliver(flush2.msg_id)
+    print(f"  第一份 FLUSH 回写内存={k.snapshot().memory[ADDR]}；"
+          f"第二份重复 FLUSH -> {rep2.status.value}（回写不执行两遍）")
+    loads = [c for c in k.completed() if c.op is Op.LOAD and c.core == 2]
+    print(f"  核2 的 load 完成次数={len(loads)}，读值={loads[0].value}")
+    assert len(loads) == 1 and loads[0].value == 200
+
+
+def part_c_enumeration():
+    print("=" * 72)
+    print("C. 枚举消息重排：最多一个 M；存在 M 时不得有 S")
     print("=" * 72)
     # 两个同时升级 + 读写交错（单地址，消息排列多）。
     scenario = [
@@ -148,9 +189,9 @@ def part_b_enumeration():
           f"{'最多一个 M 且 M 时无 S' if ok else '存在违例'}")
 
 
-def part_c_boundaries():
+def part_d_boundaries():
     print("=" * 72)
-    print("C. 实际触发的拒绝 / 异常边界（真实抛出，非预录文字）")
+    print("D. 实际触发的拒绝 / 异常边界（真实抛出，非预录文字）")
     print("=" * 72)
 
     try:
@@ -186,14 +227,21 @@ def part_c_boundaries():
     except InvalidMessageError as e:
         print(f"  5) 投递从不存在的 msg_id: {type(e).__name__}: {e}")
 
+    try:
+        k.tick(True)
+    except InvalidRequestError as e:
+        print(f"  6) tick 的步数为 bool 时拒绝: {type(e).__name__}: {e}")
+
 
 def main():
     t0 = time.perf_counter()
     part_a_invalidation_chain()
     print()
-    part_b_enumeration()
+    part_b_loss_and_retransmit()
     print()
-    part_c_boundaries()
+    part_c_enumeration()
+    print()
+    part_d_boundaries()
     dt = time.perf_counter() - t0
     print("=" * 72)
     print(f"演示结束，实际计算耗时 {dt:.2f} 秒（无 sleep、无网络、无预录结果）。")

@@ -6,7 +6,11 @@
   * deliver(msg_id: int)  投递内核待发队列中的消息（正常驱动路径）；
   * deliver(Message(...)) 显式注入一条网络消息（msg_id 传 None），
     用于表达乱序 / 重复 / 陈旧报文等外部网络输入；
-- 内核不自行丢消息、不自行乱序，pending 消息队列对调用方可见可枚举。
+- 内核不自行丢消息、不自行乱序，pending 消息队列对调用方可见可枚举；
+- 消息丢失由调用方用 lose(msg_id) 显式表达；模拟时钟由调用方用 tick()
+  推进，待发消息超过 timeout 未投递时内核自动重传一个副本（新 msg_id）。
+  重传/重复到达的报文按幂等处理：重复 FETCH/INV 只补发应答，重复
+  FLUSH/INV_ACK 按陈旧忽略，任何一次写入都不会被执行两遍。
 
 协议子集（固定规模 NUM_CORES=3, NUM_ADDRS=8）：
 - 每核每地址缓存行为 I / S / M；
@@ -175,6 +179,21 @@ class DeliveryReport:
 
 
 @dataclass(frozen=True)
+class TickReport:
+    """tick() 推进模拟时钟的结果。
+
+    steps:         本次推进的时间步数；
+    clock:         推进后的模拟时钟值；
+    retransmitted: 因超时（待发时间 >= timeout）而重传的消息副本
+                   （新 msg_id，内容与原件相同）。
+    """
+
+    steps: int
+    clock: int
+    retransmitted: tuple[Message, ...]
+
+
+@dataclass(frozen=True)
 class Snapshot:
     caches: tuple[dict[int, CacheView], ...]
     directory: tuple[DirectoryView, ...]
@@ -206,6 +225,7 @@ class _Txn:
     awaiting_flush: bool          # 正在等 owner 的 FLUSH
     awaiting_acks: set[int]       # 尚待 INV_ACK 的核集合
     flush_owner: Optional[int]    # FLUSH 阶段前的 owner
+    sent_at: int                  # 最近一次向外发消息的模拟时钟
 
 
 @dataclass
@@ -306,10 +326,17 @@ class CacheCoherenceKernel:
                 值必须是 int（bool / float / NaN / Infinity 一律拒绝）。
     """
 
-    def __init__(self, memory: Optional[dict[int, int]] = None) -> None:
+    def __init__(self, memory: Optional[dict[int, int]] = None, *,
+                 timeout: int = 10) -> None:
         if memory is not None and not isinstance(memory, dict):
             raise InvalidRequestError("memory 必须是 dict[int, int]",
                                       field="memory")
+        _check_int("timeout", timeout)
+        if timeout <= 0:
+            raise InvalidRequestError(
+                f"timeout 必须为正整数，收到 {timeout}", field="timeout")
+        self._timeout = timeout
+        self._clock = 0
         mem = [0] * NUM_ADDRS
         if memory:
             for addr, value in memory.items():
@@ -337,6 +364,16 @@ class CacheCoherenceKernel:
     @property
     def num_addrs(self) -> int:
         return NUM_ADDRS
+
+    @property
+    def clock(self) -> int:
+        """当前模拟时钟（只由 tick() 推进）。"""
+        return self._clock
+
+    @property
+    def timeout(self) -> int:
+        """重传超时阈值（时间步）。"""
+        return self._timeout
 
     def pending(self) -> tuple[Message, ...]:
         """当前待发（待投递）消息，按 msg_id 升序。"""
@@ -478,7 +515,7 @@ class CacheCoherenceKernel:
             assert owner is not None
             entry.txn = _Txn(req.txn_id, core, Op.LOAD, None,
                              awaiting_flush=True, awaiting_acks=set(),
-                             flush_owner=owner)
+                             flush_owner=owner, sent_at=self._clock)
             self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
             return done
 
@@ -508,7 +545,7 @@ class CacheCoherenceKernel:
                 return done
             entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value,
                              awaiting_flush=False, awaiting_acks=set(targets),
-                             flush_owner=None)
+                             flush_owner=None, sent_at=self._clock)
             for c in sorted(targets):
                 self._send(MsgType.INV, DIR, c, addr, req.txn_id)
             return done
@@ -517,7 +554,7 @@ class CacheCoherenceKernel:
         assert owner is not None
         entry.txn = _Txn(req.txn_id, core, Op.STORE, req.value,
                          awaiting_flush=True, awaiting_acks=set(),
-                         flush_owner=owner)
+                         flush_owner=owner, sent_at=self._clock)
         self._send(MsgType.FETCH, DIR, owner, addr, req.txn_id)
         return done
 
@@ -546,6 +583,54 @@ class CacheCoherenceKernel:
             msg_id, txn_id, mtype, src, dst, addr, value)
         return msg_id
 
+    # -- 模拟时钟 / 丢失与重传 -----------------------------------------------
+
+    def tick(self, steps: int = 1) -> TickReport:
+        """推进模拟时钟 steps 步，并对超时未投递的待发消息做重传。
+
+        超时完全由调用方通过 tick 推进时间触发；内核不自行计时。
+        重传由事务状态驱动（而不是待发队列，因为丢失的报文已不在队列里）：
+        某地址活动事务距上次向外发消息已满 timeout 个时间步时，目录按当前
+        阶段重新生成出站报文——等回写则重传 FETCH 给旧 owner，等失效则向
+        每个尚未 ACK 的核重传 INV。核端的应答（FLUSH/INV_ACK）不独立重传：
+        应答丢失时目录重传的 FETCH/INV 会让核端幂等补发应答。
+        原件若只是迟到（仍在待发队列），它与重传副本先后到达时按幂等处理
+        （见 deliver/_apply），一次写入绝不会因重复到达而执行两遍。
+        """
+        _check_int("steps", steps)
+        if steps <= 0:
+            raise InvalidRequestError(
+                f"steps 必须为正整数，收到 {steps}", field="steps")
+        self._clock += steps
+        retransmitted: list[Message] = []
+        for addr, entry in enumerate(self._dir):
+            txn = entry.txn
+            if txn is None or self._clock - txn.sent_at < self._timeout:
+                continue
+            if txn.awaiting_flush:
+                mid = self._send(MsgType.FETCH, DIR, txn.flush_owner, addr,
+                                 txn.txn_id)
+                retransmitted.append(self._pending[mid])
+            else:
+                for c in sorted(txn.awaiting_acks):
+                    mid = self._send(MsgType.INV, DIR, c, addr, txn.txn_id)
+                    retransmitted.append(self._pending[mid])
+            txn.sent_at = self._clock
+        return TickReport(steps, self._clock, tuple(retransmitted))
+
+    def lose(self, msg_id: int) -> Message:
+        """显式丢失一条待发消息（模拟网络丢包）；返回被丢失的消息。
+
+        只能丢失仍在待发队列中的消息；已投递过的 msg_id 或不存在的
+        msg_id 报 InvalidMessageError。丢失后由 tick 超时触发重传来恢复。
+        """
+        _check_int("msg_id", msg_id, msg=True)
+        msg = self._pending.pop(msg_id, None)
+        if msg is None:
+            raise InvalidMessageError(
+                f"msg_id={msg_id} 不在待发队列中，无法丢失", msg_id=msg_id)
+        return msg
+
     def deliver(self, what: Union[int, Message]) -> DeliveryReport:
         """显式网络投递。
 
@@ -556,6 +641,8 @@ class CacheCoherenceKernel:
         语义:
         - 正常消息生效并从待发队列移除；
         - 同一 msg_id 重复投递：IGNORED_DUPLICATE，幂等无副作用；
+        - 重传副本与原件先后到达：重复 FETCH/INV 幂等补发应答，重复
+          FLUSH/INV_ACK 按陈旧忽略，一次写入不会执行两遍；
         - 报文属于已结束/其他事务（典型：陈旧 INV_ACK/FLUSH）：
           IGNORED_STALE，不推进当前新事务；
         - msg_id 从不存在：InvalidMessageError；
@@ -653,14 +740,22 @@ class CacheCoherenceKernel:
                         f"地址 {msg.addr} 当前活动事务为 "
                         f"{txn.txn_id if txn else None}，不推进新事务")
             owner_line = self._caches[msg.dst][msg.addr]
-            if owner_line.state is not State.MODIFIED:
-                raise InvalidMessageError(
-                    f"FETCH 到达时核 {msg.dst} 对地址 {msg.addr} 不是 M",
-                    msg_id=msg.msg_id)
-            owner_line.state = State.SHARED
-            self._send(MsgType.FLUSH, msg.dst, DIR, msg.addr,
-                       msg.txn_id, owner_line.value)
-            return None
+            if owner_line.state is State.MODIFIED:
+                owner_line.state = State.SHARED
+                self._send(MsgType.FLUSH, msg.dst, DIR, msg.addr,
+                           msg.txn_id, owner_line.value)
+                return None
+            if owner_line.state is State.SHARED:
+                # 重复 FETCH（原件已生效后的重传副本）：owner 已降级，
+                # 幂等地补发一份 FLUSH（原 FLUSH 可能已丢失）；目录端对
+                # 重复的 FLUSH 按陈旧忽略，回写不会执行两遍。
+                self._send(MsgType.FLUSH, msg.dst, DIR, msg.addr,
+                           msg.txn_id, owner_line.value)
+                return None
+            raise InvalidMessageError(
+                f"FETCH 到达时核 {msg.dst} 对地址 {msg.addr} 状态为 "
+                f"{owner_line.state.value}（应为 M 或已降级 S）",
+                msg_id=msg.msg_id)
 
         if msg.mtype is MsgType.INV:
             # INV 必须对应处于“等失效 ACK”阶段的当前事务且接收方在等待集合中。
@@ -671,14 +766,23 @@ class CacheCoherenceKernel:
                         f"地址 {msg.addr} 当前活动事务为 "
                         f"{txn.txn_id if txn else None}，不推进新事务")
             target_line = self._caches[msg.dst][msg.addr]
-            if target_line.state is not State.SHARED:
-                raise InvalidMessageError(
-                    f"INV 到达时核 {msg.dst} 对地址 {msg.addr} 不是 S",
-                    msg_id=msg.msg_id)
-            target_line.state = State.INVALID
-            target_line.value = None
-            self._send(MsgType.INV_ACK, msg.dst, DIR, msg.addr, msg.txn_id)
-            return None
+            if target_line.state is State.SHARED:
+                target_line.state = State.INVALID
+                target_line.value = None
+                self._send(MsgType.INV_ACK, msg.dst, DIR, msg.addr,
+                           msg.txn_id)
+                return None
+            if target_line.state is State.INVALID:
+                # 重复 INV（重传副本）：该行已失效，幂等地补发 INV_ACK
+                # （原 ACK 可能已丢失）；目录端对重复 ACK 按陈旧忽略，
+                # 不会重复推进事务。
+                self._send(MsgType.INV_ACK, msg.dst, DIR, msg.addr,
+                           msg.txn_id)
+                return None
+            raise InvalidMessageError(
+                f"INV 到达时核 {msg.dst} 对地址 {msg.addr} 状态为 "
+                f"{target_line.state.value}（应为 S 或已失效 I）",
+                msg_id=msg.msg_id)
 
         if msg.mtype is MsgType.FLUSH:
             if (txn is None or txn.txn_id != msg.txn_id
@@ -706,6 +810,7 @@ class CacheCoherenceKernel:
             targets = {old_owner}
             targets.discard(txn.core)
             txn.awaiting_acks = targets
+            txn.sent_at = self._clock
             if not targets:
                 self._finalize_store(msg.addr, txn, done)
             else:
